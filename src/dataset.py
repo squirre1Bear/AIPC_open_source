@@ -118,6 +118,7 @@ class SpectrumDataset(Dataset):
             if self.need_no_fdr01_target:
                 no_fdr01_target = row["no_fdr01_target"] or 0
 
+        # 返回一个n*2的张亮，n为峰数，每个峰包含(mz, intensity)，已经过归一化、强度过滤
         spectrum = self._process_peaks(mz_array, int_array, precursor_mz, precursor_charge)
         tokens = self._tokenize(peptide)
 
@@ -208,14 +209,17 @@ class SpectrumDataset(Dataset):
             .replace('deamN', 'N[.98]') \
             .replace('deamQ', 'Q[.98]') \
             .replace('a', 'X')
-
+        # 肽段切成氨基酸
         sequence = re.split(r"(?<=.)(?=[A-Z])", sequence)
 
+        # 用int编号代替str类型的氨基酸
         tokens = torch.tensor([self.s2i[aa] for aa in sequence])
+        # 补0到固定长度
         tokens = F.pad(tokens, (0, self.max_length - tokens.shape[0]), 'constant', 0)  # padding
         return tokens
 
 
+# 将谱图的峰数补成相同的，data_mask记录哪些位置为被补上的 假数据
 def padding(data):
     ll = torch.tensor([x.shape[0] for x in data], dtype=torch.long)
     data = nn.utils.rnn.pad_sequence(data, batch_first=True)

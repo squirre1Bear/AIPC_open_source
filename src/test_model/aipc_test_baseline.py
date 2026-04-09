@@ -1,16 +1,18 @@
-import os
 import argparse
-import logging
 import gc
+import logging
+import os
+from typing import List
 
 import numpy as np
 import pandas as pd
-import yaml
-import torch
 import pyarrow.parquet as pq
+import torch
+import yaml
 from torch.utils.data import DataLoader, Dataset
 
-from src.dataset import SpectrumDataset, mkdir_p, padding, PROTON_MASS_AMU
+from src.dataset import PROTON_MASS_AMU, SpectrumDataset, mkdir_p, padding
+from src.train_model.feature_utils import build_aux_features_from_df
 from src.train_model.model_rerank import AIPCRerankNet
 
 
@@ -27,6 +29,11 @@ REQUIRED_PREDICT_COLUMNS = [
     "label",
     "weight",
     "index",
+    "rt",
+    "predicted_rt",
+    "delta_rt",
+    "sage_discriminant_score",
+    "spectrum_q",
 ]
 
 REQUIRED_POST_COLUMNS = [
@@ -40,19 +47,29 @@ REQUIRED_POST_COLUMNS = [
 ]
 
 
+def normalize_output_stem(file_path: str) -> str:
+    stem = os.path.basename(file_path)[: -len(".parquet")]
+    if stem.endswith("_benchmark"):
+        stem = stem[: -len("_benchmark")]
+    return stem
+
+
+def load_input_file_list(parquet_dir: str, file_list_path: str = "") -> List[str]:
+    if file_list_path:
+        with open(file_list_path, "r", encoding="utf-8") as f:
+            data_path_list = [line.strip() for line in f if line.strip()]
+        missing = [path for path in data_path_list if not os.path.exists(path)]
+        if missing:
+            raise FileNotFoundError(f"Some parquet files listed in {file_list_path} do not exist: {missing[:5]}")
+        return data_path_list
+
+    return sorted(os.path.join(parquet_dir, f) for f in os.listdir(parquet_dir) if f.endswith(".parquet"))
+
+
 class PredictDatasetWithIndexWeight(Dataset):
-    """
-    Adapter around the project's SpectrumDataset.
-
-    The original SpectrumDataset return signatures depend on flag combinations.
-    In this codebase, using need_label=True, need_weight=True, need_index=True does NOT
-    return index; it falls through to the (need_label and need_weight) branch and returns:
-        spectrum, precursor_mz, precursor_charge, tokens, peptide, label, weight
-    Therefore we wrap it and append index/weight explicitly in a stable order.
-    """
-
     def __init__(self, df: pd.DataFrame, s2i: dict, n_peaks: int):
         self.df = df.reset_index(drop=True).copy()
+        self.aux_features = build_aux_features_from_df(self.df)
         self.base_ds = SpectrumDataset(
             self.df,
             s2i,
@@ -70,12 +87,12 @@ class PredictDatasetWithIndexWeight(Dataset):
         spectrum, precursor_mz, precursor_charge, tokens, peptide, label, weight = self.base_ds[idx]
         row = self.df.iloc[idx]
         index = row["index"]
-        return spectrum, precursor_mz, precursor_charge, tokens, label, index, weight
-
+        aux_features = self.aux_features[idx]
+        return spectrum, precursor_mz, precursor_charge, tokens, label, index, weight, aux_features
 
 
 def collate_batch_index_weight_local(batch):
-    spectra, precursor_mzs, precursor_charges, tokens, label, index, weight = zip(*batch)
+    spectra, precursor_mzs, precursor_charges, tokens, label, index, weight, aux_features = zip(*batch)
 
     spectra, spectra_mask = padding(spectra)
     tokens = torch.stack(tokens, dim=0)
@@ -88,35 +105,28 @@ def collate_batch_index_weight_local(batch):
     label = torch.tensor(label, dtype=torch.float32)
     index = torch.tensor(index, dtype=torch.int32)
     weight = torch.tensor(weight, dtype=torch.float32)
+    aux_features = torch.tensor(np.asarray(aux_features), dtype=torch.float32)
 
-    return spectra, spectra_mask, precursors, tokens, label, index, weight
-
+    return spectra, spectra_mask, precursors, tokens, label, index, weight, aux_features
 
 
 def get_fdr_result(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["decoy"] = np.where(df["label"] == 1, 0, 1)
-
-    target_num = (df["decoy"] == 0).cumsum()
-    decoy_num = (df["decoy"] == 1).cumsum()
-
-    target_num = target_num.replace(0, 1)
-    decoy_num = decoy_num.replace(0, 1)
-
+    target_num = (df["decoy"] == 0).cumsum().replace(0, 1)
+    decoy_num = (df["decoy"] == 1).cumsum().replace(0, 1)
     df["q_value"] = decoy_num / target_num
     df["q_value"] = df["q_value"][::-1].cummin()[::-1]
     return df
-
 
 
 def load_vocab_from_yaml(config_path):
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
-    vocab = ['<pad>', '<mask>'] + list(config["residues"].keys()) + ['<unk>']
+    vocab = ["<pad>", "<mask>"] + list(config["residues"].keys()) + ["<unk>"]
     s2i = {v: i for i, v in enumerate(vocab)}
     return config, vocab, s2i
-
 
 
 def load_model(model_path, vocab_size, device):
@@ -126,7 +136,6 @@ def load_model(model_path, vocab_size, device):
         raise ValueError(f"{model_path} is not a valid AIPCRerankNet checkpoint")
 
     cfg = ckpt["config"]
-
     model = AIPCRerankNet(
         vocab_size=vocab_size,
         token_embed_dim=cfg.get("token_embed_dim", 128),
@@ -144,17 +153,14 @@ def load_model(model_path, vocab_size, device):
     return model
 
 
-
 def get_available_columns(file_path):
     pf = pq.ParquetFile(file_path)
     return pf.schema_arrow.names
 
 
-
 def pick_existing_columns(file_path, columns):
     available = set(get_available_columns(file_path))
     return [c for c in columns if c in available]
-
 
 
 def gen_dl(df, s2i, n_peaks, batch_size, index_offset=0):
@@ -184,21 +190,24 @@ def gen_dl(df, s2i, n_peaks, batch_size, index_offset=0):
 def predict_batch_df(dl, model, device):
     pred_rows = []
 
-    for spectra, spectra_mask, precursors, tokens, label, index, weight in dl:
+    for spectra, spectra_mask, precursors, tokens, label, index, weight, aux_features in dl:
         spectra = spectra.to(device, non_blocking=True)
         spectra_mask = spectra_mask.to(device, non_blocking=True)
         precursors = precursors.to(device, non_blocking=True)
         tokens = tokens.to(device, non_blocking=True)
+        aux_features = aux_features.to(device, non_blocking=True)
 
-        logits = model(spectra, spectra_mask, precursors, tokens)
-        score = torch.sigmoid(logits).detach().cpu().numpy()
+        logits = model(spectra, spectra_mask, precursors, tokens, aux_features)
+        score = logits.detach().cpu().numpy()
 
-        batch_df = pd.DataFrame({
-            "index": index.cpu().numpy().astype(np.int32),
-            "score": score.astype(np.float32),
-            "label": label.cpu().numpy().astype(np.int32),
-            "weight": weight.cpu().numpy().astype(np.float32),
-        })
+        batch_df = pd.DataFrame(
+            {
+                "index": index.cpu().numpy().astype(np.int32),
+                "score": score.astype(np.float32),
+                "label": label.cpu().numpy().astype(np.int32),
+                "weight": weight.cpu().numpy().astype(np.float32),
+            }
+        )
         pred_rows.append(batch_df)
 
     if not pred_rows:
@@ -218,7 +227,7 @@ def predict_one_file_streaming(file_path, s2i, n_peaks, predict_batch_size, parq
 
     pf = pq.ParquetFile(file_path)
     total_rows = pf.metadata.num_rows
-    logger.info(f"Streaming parquet: rows={total_rows}, row_groups={pf.num_row_groups}, parquet_batch_rows={parquet_batch_rows}")
+    logger.info("Streaming parquet: rows=%d, row_groups=%d, parquet_batch_rows=%d", total_rows, pf.num_row_groups, parquet_batch_rows)
 
     wrote_header = False
     total_pred_rows = 0
@@ -234,13 +243,7 @@ def predict_one_file_streaming(file_path, s2i, n_peaks, predict_batch_size, parq
         total_pred_rows += len(pred_df)
         row_offset += len(batch_df)
 
-        logger.info(
-            "Predict batch %d: batch_rows=%d, cumulative_pred_rows=%d/%d",
-            batch_idx,
-            len(batch_df),
-            total_pred_rows,
-            total_rows,
-        )
+        logger.info("Predict batch %d: batch_rows=%d, cumulative_pred_rows=%d/%d", batch_idx, len(batch_df), total_pred_rows, total_rows)
 
         del batch_df, dl, pred_df, record_batch
         if device.type == "cuda":
@@ -251,9 +254,8 @@ def predict_one_file_streaming(file_path, s2i, n_peaks, predict_batch_size, parq
         raise ValueError(f"Prediction row mismatch for {os.path.basename(file_path)}: pred_rows={total_pred_rows}, parquet_rows={total_rows}")
 
 
-
 def postprocess_file_light(file_path, score_dir):
-    file_name = os.path.basename(file_path)[:-len(".parquet")]
+    file_name = normalize_output_stem(file_path)
     score_path = os.path.join(score_dir, file_name + "_pred.csv")
 
     post_columns = pick_existing_columns(file_path, REQUIRED_POST_COLUMNS)
@@ -270,8 +272,8 @@ def postprocess_file_light(file_path, score_dir):
 
     score_df = pd.read_csv(score_path).drop_duplicates(subset="index")
 
-    assert len(df) == len(score_df), \
-        f"{file_name}: parquet length ({len(df)}) and score length ({len(score_df)}) are inconsistent"
+    if len(df) != len(score_df):
+        raise ValueError(f"{file_name}: parquet length ({len(df)}) and score length ({len(score_df)}) are inconsistent")
 
     df = df.merge(score_df[["index", "score"]], on="index", how="left")
 
@@ -296,12 +298,13 @@ def postprocess_file_light(file_path, score_dir):
     )
 
     target_df = df[df["label"] == 1].copy()
-
-    target_df = target_df.rename(columns={
-        "precursor_sequence": "modified_sequence",
-        "charge": "precursor_charge",
-        scan_col: "scan_number",
-    })
+    target_df = target_df.rename(
+        columns={
+            "precursor_sequence": "modified_sequence",
+            "charge": "precursor_charge",
+            scan_col: "scan_number",
+        }
+    )
 
     target_df["modified_sequence"] = (
         target_df["modified_sequence"]
@@ -333,45 +336,41 @@ def postprocess_file_light(file_path, score_dir):
     return target_df[required_columns]
 
 
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", required=True)
     parser.add_argument("--parquet_dir", required=True)
-    parser.add_argument("--config", required=True, help="same yaml used in 3_convert_parquet2pkl.py")
+    parser.add_argument("--config", required=True, help="same yaml used in training")
     parser.add_argument("--out_path", default="")
     parser.add_argument("--predict_batch_size", type=int, default=512)
-    parser.add_argument("--parquet_batch_rows", type=int, default=4096,
-                        help="rows loaded from parquet per streaming chunk; reduce this if host RAM is tight")
+    parser.add_argument("--parquet_batch_rows", type=int, default=4096, help="rows loaded from parquet per streaming chunk")
+    parser.add_argument("--file_list", default="", help="Optional text file containing absolute parquet paths to process, one per line")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
+    logger.info("Using device: %s", device)
 
     config, vocab, s2i = load_vocab_from_yaml(args.config)
-    logger.info(f"Loaded vocab size = {len(vocab)}")
+    logger.info("Loaded vocab size = %d", len(vocab))
 
     model = load_model(args.model_path, len(vocab), device)
 
     out_path = args.out_path if args.out_path else args.parquet_dir
     mkdir_p(out_path)
-    logger.info(f"Output dir: {out_path}")
+    logger.info("Output dir: %s", out_path)
 
-    data_path_list = sorted([
-        os.path.join(args.parquet_dir, f)
-        for f in os.listdir(args.parquet_dir)
-        if f.endswith(".parquet")
-    ])
+    data_path_list = load_input_file_list(args.parquet_dir, args.file_list)
+    logger.info("Total parquet files to process: %d", len(data_path_list))
 
     for file_path in data_path_list:
-        file_name = os.path.basename(file_path)[:-len(".parquet")]
-        logger.info(f"Processing: {file_name}")
+        file_name = normalize_output_stem(file_path)
+        logger.info("Processing: %s", file_name)
 
         pred_csv = os.path.join(out_path, f"{file_name}_pred.csv")
         benchmark_tsv = os.path.join(out_path, f"{file_name}_benchmark_result.tsv")
 
         if os.path.exists(benchmark_tsv):
-            logger.info(f"Skip existing result: {benchmark_tsv}")
+            logger.info("Skip existing result: %s", benchmark_tsv)
             continue
 
         if os.path.exists(pred_csv):
@@ -389,18 +388,8 @@ def main():
         )
         result_df = postprocess_file_light(file_path, out_path)
         result_df.to_csv(benchmark_tsv, sep="\t", index=False)
-
-        logger.info(f"Saved: {benchmark_tsv}")
+        logger.info("Saved: %s", benchmark_tsv)
 
 
 if __name__ == "__main__":
     main()
-
-
-# python -m src.test_model.aipc_test_baseline ^
-#   --model_path E:/AIPC_runs/run1/best.pt ^
-#   --parquet_dir E:/AIPC_dataset/bas_test_dataset ^
-#   --config D:/Python_Projects/pfind_AIPC/model.yaml ^
-#   --out_path E:/AIPC_dataset/bas_test_score ^
-#   --predict_batch_size 2048 ^
-#   --parquet_batch_rows 16384

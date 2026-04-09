@@ -22,6 +22,7 @@ raw_df['scan'] = raw_df['scan'].astype(int)
 sage_df = pd.read_parquet(args.sage_sr)
 sage_df['scan'] = sage_df['scan'].astype(int)
 sage_df['psm_id'] = sage_df['scan'].astype(str) + '_' + sage_df['precursor_sequence']
+# 注.sage_df[]==1会按结果生成一份bool列表，为ture的列会被保留
 sage_df_target = sage_df[sage_df['label']==1]
 sage_df_decoy = sage_df[sage_df['label']==0]
 # 读取fp数据

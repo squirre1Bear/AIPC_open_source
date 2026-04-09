@@ -13,6 +13,7 @@ import pickle
 from multiprocessing import Process
 
 from dataset import SpectrumDataset, collate_batch_weight
+from train_model.feature_utils import build_aux_features_from_df
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger()
@@ -61,6 +62,7 @@ def construct_data(data_path_list,
                     'precursors': precursors.numpy(),
                     'tokens': tokens.numpy(),
                     'peptides': peptides,
+                    'aux_features': build_aux_features_from_df(df),
                     'label': label.numpy(),
                     'weight': weight.numpy()}
 
@@ -113,7 +115,7 @@ if __name__ == '__main__':
     parser.add_option("--file_dir", type="string",
                       default=r"E:\AIPC_dataset\mzml_parquet_split",
                       help=".parquet directory")
-    parser.add_option("--config", type="string", default=r"D:\Python_Projects\pfind_AIPC\model.yaml",
+    parser.add_option("--config", type="string", default="/home/yhc/projects/pfind_AIPC/model.yaml",
                       help=".parquet directory")
     parser.add_option("--task_name", type="string", default="target_top08_ft_02", help="task_name")
     parser.add_option("--ncores", type="int", default=4, help="number of CPU cores, range is [1, 20]")
@@ -136,4 +138,10 @@ if __name__ == '__main__':
     convert_data(options, s2i, config['n_peaks'])
     logger.info('getdata end!!!!')
 
-# python ./src/3_convert_parquet2pkl.py  --file_dir "E:\AIPC_dataset\mzml_parquet_split" --task_name test_16m_mzml --ncores 20 --save_dir "E:\AIPC_dataset\mzml_pkl"
+
+# python3 ./src/3_convert_parquet2pkl.py ^
+#   --file_dir ./data/mzml_parquet_split ^
+#   --task_name test_16m_mzml --ncores 20 ^
+#   --save_dir ./data/mzml_pkl
+
+# python3 ./src/3_convert_parquet2pkl.py  --file_dir ./data/mzml_parquet_split --task_name test_16m_mzml --ncores 20 --save_dir ./data/mzml_pkl

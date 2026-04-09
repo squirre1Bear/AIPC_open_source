@@ -25,6 +25,7 @@ class AIPCRerankNet(nn.Module):
         token_embed_dim: int = 128,
         precursor_dim: int = 64,
         hidden_dim: int = 256,
+        aux_feature_dim: int = 10,
         n_heads: int = 8,
         n_layers: int = 2,
         dropout: float = 0.1,
@@ -68,7 +69,16 @@ class AIPCRerankNet(nn.Module):
             nn.GELU(),
         )
 
-        fused_dim = hidden_dim + token_embed_dim + precursor_dim + 2
+        self.aux_feature_mlp = nn.Sequential(
+            nn.Linear(aux_feature_dim, precursor_dim),
+            nn.GELU(),
+            nn.LayerNorm(precursor_dim),
+            nn.Dropout(dropout),
+            nn.Linear(precursor_dim, precursor_dim),
+            nn.GELU(),
+        )
+
+        fused_dim = hidden_dim + token_embed_dim + precursor_dim + precursor_dim + 2
         self.classifier = nn.Sequential(
             nn.Linear(fused_dim, hidden_dim),
             nn.GELU(),
@@ -85,7 +95,7 @@ class AIPCRerankNet(nn.Module):
         denom = valid.sum(dim=1).clamp_min(eps)
         return (x * valid).sum(dim=1) / denom
 
-    def forward(self, spectra, spectra_mask, precursors, tokens):
+    def forward(self, spectra, spectra_mask, precursors, tokens, aux_features=None):
         token_pad_mask = tokens.eq(0)
         tok = self.token_embed(tokens)
         tok = self.token_pos(tok)
@@ -97,6 +107,13 @@ class AIPCRerankNet(nn.Module):
         spec_pool = self.masked_mean(spec, spectra_mask)
 
         prec = self.precursor_mlp(precursors[:, :2])
+        if aux_features is None:
+            aux_features = torch.zeros(
+                (precursors.size(0), self.aux_feature_mlp[0].in_features),
+                dtype=precursors.dtype,
+                device=precursors.device,
+            )
+        aux = self.aux_feature_mlp(aux_features)
 
         tok_for_cos = tok_pool
         if tok_for_cos.size(1) < spec_pool.size(1):
@@ -112,6 +129,6 @@ class AIPCRerankNet(nn.Module):
 
         length_feat = tokens.ne(0).sum(dim=1, keepdim=True).float() / max(1, tokens.size(1))
 
-        fused = torch.cat([spec_pool, tok_pool, prec, cosine, length_feat], dim=-1)
+        fused = torch.cat([spec_pool, tok_pool, prec, aux, cosine, length_feat], dim=-1)
         logit = self.classifier(fused).squeeze(-1)
         return logit
