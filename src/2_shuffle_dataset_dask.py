@@ -156,8 +156,8 @@ def process_and_split_parquet_streaming_fast(
 
 
 if __name__ == "__main__":
-    input_data_directory = r"E:/AIPC_dataset/mzml_parquet"
-    output_data_directory = r"E:/AIPC_dataset/mzml_parquet_split"
+    input_data_directory = "./data/mzml_parquet"
+    output_data_directory = "./data/mzml_parquet_split"
 
     target_rows_per_file = 256
 
@@ -168,3 +168,5 @@ if __name__ == "__main__":
         batch_size=50000,   # 内存紧张可调到 10000~20000
         random_state=42,
     )
+
+# python3 ./src/2_shuffle_dataset_dask.py
