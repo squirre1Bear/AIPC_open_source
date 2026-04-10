@@ -279,16 +279,15 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-# python3 test_model/aipc_multi_gpu_predict.py ^
-#   --project_root D:/Python_Projects/pfind_AIPC ^
-#   --python_executable D:/Python_Projects/pfind_AIPC/.venv/Scripts/python.exe ^
-#   --model_path D:/Python_Projects/pfind_AIPC/model/best_full_aux_20260407_v1/best.pt ^
-#   --parquet_dir E:/AIPC_dataset/bas_test_dataset ^
-#   --config D:/Python_Projects/pfind_AIPC/model.yaml ^
-#   --out_path E:/AIPC_dataset/bas_test_score ^
-#   --predict_batch_size 512 ^
-#   --parquet_batch_rows 4096 ^
-#   --gpus auto ^
+# python3 src/test_model/aipc_multi_gpu_predict.py \
+#   --project_root /home/yhc/projects/AIPC/ \
+#   --model_path /home/yhc/projects/pfind_AIPC/model/best_full_aux_20260407_v1/best.pt \
+#   --parquet_dir ./data/bas_test_dataset \
+#   --config ./model.yaml \
+#   --out_path ./data/bas_test_score \
+#   --predict_batch_size 512 \
+#   --parquet_batch_rows 4096 \
+#   --gpus auto \
 #   --type basic
 
 

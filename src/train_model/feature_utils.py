@@ -1,10 +1,12 @@
+# 整理parquet表格里的辅助列，变成固定长度的数值向量
+
 import re
 from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
 
-
+# 神经网络输入的尺度不要差太大，所以要对每个量进行归一化
 AUX_FEATURE_COLUMNS = [
     "precursor_mz_norm",
     "charge_norm",
@@ -18,7 +20,7 @@ AUX_FEATURE_COLUMNS = [
     "mod_count_norm",
 ]
 
-
+# 把pandas数据变成numpy张量数组
 def _safe_numeric(series: Optional[pd.Series], length: int) -> np.ndarray:
     if series is None:
         return np.zeros(length, dtype=np.float32)
@@ -26,6 +28,7 @@ def _safe_numeric(series: Optional[pd.Series], length: int) -> np.ndarray:
     return arr
 
 
+# 获取肽段长度（这里先去除了[+n]修饰，再求长度）
 def _sequence_lengths(sequences: Iterable[str], default_len: int) -> np.ndarray:
     lengths = []
     for seq in sequences:
@@ -36,6 +39,7 @@ def _sequence_lengths(sequences: Iterable[str], default_len: int) -> np.ndarray:
     return np.asarray(lengths, dtype=np.float32)
 
 
+# 统计修饰数
 def _modification_counts(sequences: Iterable[str]) -> np.ndarray:
     counts = []
     for seq in sequences:
@@ -55,6 +59,7 @@ def build_aux_features_from_df(df: pd.DataFrame, default_seq_len: int = 0) -> np
     )
     sequences = df[sequence_col].tolist() if sequence_col else [""] * length
 
+    # 读取10维特征，并转为张量
     precursor_mz = _safe_numeric(df.get("precursor_mz"), length)
     charge = _safe_numeric(df.get("charge", df.get("precursor_charge")), length)
     rt = _safe_numeric(df.get("rt"), length)
@@ -65,6 +70,9 @@ def build_aux_features_from_df(df: pd.DataFrame, default_seq_len: int = 0) -> np
     peptide_length = _sequence_lengths(sequences, default_seq_len)
     mod_count = _modification_counts(sequences)
 
+    # 归一化，并将生成（n, 10）形状的数组
+    # np.clip(x, a, b)  x>a输出a,x<b输出b,此外输出x
+    # np.tanh(x) x映射到(-1, 1)范围
     features = np.stack(
         [
             np.clip(precursor_mz / 2000.0, 0.0, 3.0),
