@@ -17,13 +17,13 @@ def build_vocab_from_yaml(config_path: str):
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     vocab = ["<pad>", "<mask>"] + list(cfg["residues"].keys()) + ["<unk>"]
-    s2i = {v: i for i, v in enumerate(vocab)}
+    s2i = {v: i for i, v in enumerate(vocab)}  # enumerate先返回编号i，再返回取出的值
     return cfg, vocab, s2i
 
 
 def collate_predict(batch: List[Tuple]):
     spectra, precursor_mzs, precursor_charges, tokens, peptides, aux_features = zip(*batch)
-    spectra, spectra_mask = padding(list(spectra))
+    spectra, spectra_mask = padding(list(spectra))  # 依次返回 pad之后的结果，哪些位置被pad了（..._mask）
     tokens = torch.stack(tokens, dim=0)
     precursor_mzs = torch.tensor(precursor_mzs)
     precursor_charges = torch.tensor(precursor_charges)
@@ -78,7 +78,9 @@ def predict_one_file(model, file_path: str, s2i: dict, cfg: dict, batch_size: in
         precursors = precursors.to(device)
         tokens = tokens.to(device)
         aux_features = aux_features.to(device)
+        # 预测
         logits = model(spectra, spectra_mask, precursors, tokens, aux_features)
+        # 归一化生成概率
         prob = torch.sigmoid(logits)
         scores.append(logits.cpu())
         probs.append(prob.cpu())
