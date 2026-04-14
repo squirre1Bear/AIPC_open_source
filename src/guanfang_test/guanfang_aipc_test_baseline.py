@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 # 复用你原来的 dataset / collate / mkdir_p
-from ..transformer.dataset import (
+from src_guanfang.transformer.dataset import (
     SpectrumDataset,
     mkdir_p,
     collate_batch_weight_deltaRT_index,
