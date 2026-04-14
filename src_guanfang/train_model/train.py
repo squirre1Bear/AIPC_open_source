@@ -97,16 +97,22 @@ def get_torch_optimizer(optimizer):
 
 
 # save checkpoint
+# model_engine为DeepSpeed封装后的模型引擎。
+# client_state自定义的其他要保存的信息
+# 可选是否排除被冻结的参数
 def save_checkpoint(model_engine, save_dir, tag, client_state={}, exclude_frozen_parameters=False):
     save_path = model_engine._get_ckpt_name(save_dir, tag)
     mkdir_p(os.path.join(save_dir, str(tag)))
 
+    # 判断是否启用了零冗余优化器
     zero_optimizer_state = model_engine.zero_optimization() or model_engine.bfloat16_enabled()
     save_frozen_param = model_engine.zero_optimization_partition_gradients() and not exclude_frozen_parameters
 
     # get model states
+    # stata_dict：状态字典，存储模型所有的参数
     module = model_engine.module_state_dict(exclude_frozen_parameters=exclude_frozen_parameters)
 
+    # 用字典记录了一堆模型当前信息
     state = dict(
         module=module,
         buffer_names=model_engine._get_buffer_names(),
@@ -129,8 +135,10 @@ def save_checkpoint(model_engine, save_dir, tag, client_state={}, exclude_frozen
         mp_world_size=model_engine.mp_world_size,
         ds_config=model_engine.config
     )
+    # 把client_state合并到state字典里
     state.update(client_state)
 
+    # 存储刚才保存的state，记录存档点
     checkpoint_engine = TorchCheckpointEngine()
     checkpoint_engine.save(state, save_path)
 
@@ -142,9 +150,9 @@ class WarmupScheduler(object):
                  max_iter: int,
                  max_lr: int,
                  min_lr: int,
-                 second_min_lr: int,
+                 second_min_lr: int,  # 第二小学习率。如果学习率小于min_lr，则直接设为second_min_lr
                  warmup_type: str,
-                 last_batch_iteration: int = -1):
+                 last_batch_iteration: int = -1):  # 上一个batch的编号
 
         self.optimizer = get_torch_optimizer(optimizer)
 
@@ -156,22 +164,31 @@ class WarmupScheduler(object):
         self.second_min_lr = second_min_lr
 
         self.last_batch_iteration = last_batch_iteration
+        # param_groups为[[],[],[]...]，存储[每一层]的参数。
+        # 每一层可能有不同学习率，这里记录各层的初始学习率。
         self.org_lrs = [group['lr'] for group in self.optimizer.param_groups]
 
+    # 指数衰减因子，用于乘到学习率前面
     def get_exponential_lr_factor(self) -> float:
         """Get the learning rate factor for the current step (exponential decay)"""
         lr_factor = 1.0
+
+        # 当前轮数较小，还在warmup段。使用线性学习率，逐步增长到1.0
         if self.last_batch_iteration <= self.warmup_iter:
             lr_factor *= self.last_batch_iteration / self.warmup_iter
+        # warmup结束后，学习率开始衰减
         else:
             lr_factor = (1 - (self.last_batch_iteration - self.warmup_iter) / (self.max_iter - self.warmup_iter)) ** 0.9
         return lr_factor
 
+    # 另一种学习率变化策略，余弦退火因子
     def get_cosine_lr_factor(self) -> float:
         """Get the learning rate factor for the current step (cosine annealing)"""
         lr_factor = 1.0
+        # warmup期间线性增长
         if self.last_batch_iteration <= self.warmup_iter:
             lr_factor *= self.last_batch_iteration / self.warmup_iter
+        # 余弦下降
         else:
             lr = self.min_lr + \
                  0.5 * (self.max_lr - self.min_lr) * (
@@ -180,6 +197,7 @@ class WarmupScheduler(object):
         return lr_factor
 
     def get_lr_ratio(self):
+        # 还没开始训练（last_batch_初始值为-1）
         if self.last_batch_iteration < 0:
             logger.warning("Attempting to get learning rate from scheduler before it has started")
             return [0.0]
@@ -192,6 +210,7 @@ class WarmupScheduler(object):
             ratio = 1.0
 
         if isinstance(ratio, float):
+            # 防止异常值
             ratio = min(1.0, ratio)
         else:
             # Set to 0 when the learning rate factor is complex
@@ -200,11 +219,14 @@ class WarmupScheduler(object):
         return ratio
 
     def step(self, last_batch_iteration=None):
+        # 更新本次步数
         if last_batch_iteration is None:
             last_batch_iteration = self.last_batch_iteration + 1
         self.last_batch_iteration = last_batch_iteration
 
         lrs = self.get_lr()
+        # zip(a, b)会进行迭代，每次返回(a[i],b[i])，只需a、b长度相同即可
+        # 这里optimizer.param_groups长度是层数，lrs长度也是层数（表示每一层的学习率）
         for param_group, lr in zip(self.optimizer.param_groups, lrs):
             param_group['lr'] = lr
         self._last_lr = [group['lr'] for group in self.optimizer.param_groups]
@@ -214,6 +236,7 @@ class WarmupScheduler(object):
             logger.warning("Attempting to get learning rate from scheduler before it has started")
             return [0.0]
         lr_ratio = self.get_lr_ratio()
+        # 下面为列表推导式 [当前位置的值 for x in list]，会遍历list中的每一个元素x，并通过最开始的表达式填入新list的当前位置
         return [org_lr * lr_ratio if float(org_lr * lr_ratio) > self.min_lr else self.second_min_lr for org_lr in
                 self.org_lrs]
 
@@ -222,6 +245,7 @@ class WarmupScheduler(object):
         assert getattr(self, '_last_lr', None) is not None, "need to call step() first"
         return self._last_lr
 
+    # 保存检查点的时候使用
     def state_dict(self):
         return {'last_batch_iteration': self.last_batch_iteration}
 
@@ -381,30 +405,31 @@ def train(model_engine, trainloader, sw, optim, scheduler, local_device, target_
 
 
 def main():
-    # Initialize distributed training
+    # deepspeed初始化分布式训练环境
     deepspeed.init_distributed(timeout=datetime.timedelta(seconds=5400))
     torch.cuda.set_device(args.local_rank)
 
-    # load config
+    # 加载配置
     config_path = args.config
     with open(config_path) as f_in:
         config = yaml.safe_load(f_in)
 
     # Synchronize across processes
+    # 如果当前进程不是主进程（编号0），就停下来等待0号进程。barrier为同步点
     if torch.distributed.get_rank() != 0:
         torch.distributed.barrier()
 
-    # Build the vocabulary
+    # 词表，用于将str类型的token转为整数ID。residue 残基
     vocab = ['<pad>', '<mask>'] + list(config["residues"].keys()) + ['<unk>']
     config["vocab"] = vocab
     config["node_num"] = args.node_num
     config["gpu_num"] = args.gpu_num
+    # enumerate(list)返回 下标i，原值v
+    s2i = {v: i for i, v in enumerate(vocab)}
+    logging.info(f"Vocab: {s2i}")
 
     # set seeds
     set_seeds(config['seed'])
-
-    s2i = {v: i for i, v in enumerate(vocab)}
-    logging.info(f"Vocab: {s2i}")
 
     # mkdir save dirs
     mkdir_p(config["tb_summarywriter"])
@@ -425,7 +450,7 @@ def main():
     ########################################################################
     # define model
     model = MSGPT(
-        dim_model=config["dim_model"],
+        dim_model=config["dim_model"],  # 每个token被映射到了dim_model维度
         n_head=config["n_head"],
         dim_feedforward=config["dim_feedforward"],
         n_layers=config["n_layers"],
@@ -435,13 +460,15 @@ def main():
         max_charge=config["max_charge"],
     )
 
-    # Load a pretrained model (if available)
+    # 如果模型已经进行过训练，则加载ckpt接着训练
     if (config['init_model_path'] is not None) and config['init_model_path'] != '':
         logging.info(f"Loading model checkpoint from '{config['init_model_path']}'")
         model = MSGPT.load_pt(config['init_model_path'], config)
         model = model.to(torch.bfloat16)
 
-    # Select parameters to be trained
+    # 找可训练参数（.requires_grad），被冻结的参数不算入
+    # filter(函数func，可迭代对象iter)，从iter依次取值放入func，如果返回true则iter[i]会保留到结果list
+    # lambda p: 返回值。是个函数
     parameters = filter(lambda p: p.requires_grad, model.parameters())
 
     # Initialize the optimizer

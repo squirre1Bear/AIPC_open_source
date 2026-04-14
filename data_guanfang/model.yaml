@@ -36,27 +36,27 @@ residues:
   "Q": 128.058578
   "R": 156.101111
   "S": 87.032028
-  "T": 101.047679
+  "T": 101.047679 
   "U": 150.953633
   "V": 99.068414
   "W": 186.079313
   "Y": 163.063329
-  "C[57.02]": 160.030649
-  "M[15.99]": 147.035400
+  "C[57.02]": 160.030649 
+  "M[15.99]": 147.035400 
   "N[.98]": 115.026943
   "Q[.98]": 129.042594
-  "X": 42.010565 # n[42]
+  "X": 42.010565 # n[42] 
 
 n_log: 1
 # input params
-train_path: "./data/mzml_pkl"
-valid_path: "./data/mzml_pkl"
+train_path: '/storage/guotiannanLab/liuzhiwei/DDA_BERT/target_top08_ft_04/'
+valid_path: '/storage/guotiannanLab/liuzhiwei/DDA_BERT/target_top08_ft_04/'
 init_model_path: ''
 
 # out params
-tb_summarywriter: "./logs"
-model_save_path: "./model/checkpoints"
-out_path: "."
+tb_summarywriter: "/storage/guotiannanLab/liuzhiwei/DDA_BERT/logs/target_top08_ft_04/"
+model_save_path: "/storage/guotiannanLab/liuzhiwei/DDA_BERT/checkpoints/target_top08_ft_04/"
+out_path: "/storage/guotiannanLab/liuzhiwei/DDA_BERT/"
 
 warmup_ratio: 0.2 # warmup ratio of max_iters
 learning_rate: 5e-5
@@ -74,3 +74,4 @@ val_step_ratio: 0.8 # tensorboard monitor ratio of val phase
 
 logger:
 epochs: 25
+
