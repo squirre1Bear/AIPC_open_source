@@ -336,4 +336,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-# python3 src/guanfang_test/guanfang_aipc_test_baseline.py --model_path model/best_full_aux_20260407_v1/best.pt --parquet_dir data/mzml_parquet --out_path data/score
+# python3 -m src.guanfang_test.guanfang_aipc_test_baseline --model_path model/best_full_aux_20260407_v1/best.pt --parquet_dir data/mzml_parquet --out_path data/score

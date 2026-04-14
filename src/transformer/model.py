@@ -8,8 +8,8 @@ import torch.nn.functional as F
 import yaml
 import numpy as np
 
-from transformer.layers import MultiScalePeakEmbedding
-from transformer.decoder import PeptideDecoder
+from ..transformer.layers import MultiScalePeakEmbedding
+from ..transformer.decoder import PeptideDecoder
 
 def transform(m : nn.Module) -> nn.Module:
     gm : torch.fx.GraphModule = torch.fx.symbolic_trace(m)
