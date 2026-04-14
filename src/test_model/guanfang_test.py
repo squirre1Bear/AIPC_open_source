@@ -18,9 +18,10 @@ from torch.utils.data import DataLoader
 import lightning.pytorch as ptl
 from lightning.pytorch.strategies import DDPStrategy
 
-from src.dataset import PROTON_MASS_AMU, SpectrumDataset, mkdir_p, padding
+from src.dataset import PROTON_MASS_AMU, SpectrumDataset, mkdir_p, padding,collate_batch_weight_deltaRT_index
 from src.train_model.feature_utils import build_aux_features_from_df
 from src.train_model.model_rerank import AIPCRerankNet
+
 
 # Configure logger
 logger = logging.getLogger()
@@ -29,24 +30,6 @@ logger.setLevel(logging.INFO)
 import warnings
 
 warnings.filterwarnings("ignore")
-
-def collate_batch_index_weight_local(batch):
-    spectra, precursor_mzs, precursor_charges, tokens, label, index, weight, aux_features = zip(*batch)
-
-    spectra, spectra_mask = padding(spectra)
-    tokens = torch.stack(tokens, dim=0)
-
-    precursor_mzs = torch.tensor(precursor_mzs)
-    precursor_charges = torch.tensor(precursor_charges)
-    precursor_masses = (precursor_mzs - PROTON_MASS_AMU) * precursor_charges
-    precursors = torch.vstack([precursor_masses, precursor_charges]).T.float()
-
-    label = torch.tensor(label, dtype=torch.float32)
-    index = torch.tensor(index, dtype=torch.int32)
-    weight = torch.tensor(weight, dtype=torch.float32)
-    aux_features = torch.tensor(np.asarray(aux_features), dtype=torch.float32)
-
-    return spectra, spectra_mask, precursors, tokens, label, index, weight, aux_features
 
 def get_fdr_result(df: pd.DataFrame) -> pd.DataFrame:
     """Calculates the q-value (False Discovery Rate) for PSMs."""
@@ -101,6 +84,7 @@ class Evalute(ptl.LightningModule):
 
         # Perform prediction (Loss calculation is often skipped in test_step for pure prediction)
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            # 计算预测结果。第二个返回值为loss被忽略
             pred, _ = self.model.pred(spectra, spectra_mask, precursors, tokens)
 
         # Move outputs and metadata to CPU and convert to numpy for list extension
@@ -157,7 +141,7 @@ def gen_dl(df, config):
                     batch_size=config["predict_batch_size"],
                     num_workers=0,  # Set to 0 to potentially avoid multiprocessing issues during evaluation
                     shuffle=False,
-                    collate_fn=collate_batch_index_weight_local(),  # Custom collate function
+                    collate_fn= collate_batch_weight_deltaRT_index,  # Custom collate function
                     pin_memory=True)
     logging.info(f"Data: {len(ds):,} samples, DataLoader: {len(dl):,}")
     return dl
@@ -253,7 +237,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path")
     parser.add_argument("--parquet_dir")  # Input directory containing parquet files
-    parser.add_argument("--config", default="/zhangxiaofan/DDA_BERT_deltaRT/yaml/ajun_dataset62_deltart.yaml")
+    parser.add_argument("--config", default="model.yaml")
     parser.add_argument("--out_path",
                         default='')  # If empty, output path is same as input; otherwise, use the specified path
     args = parser.parse_args()
@@ -278,7 +262,17 @@ def main() -> None:
         if model_type == 'pth':
             model = torch.load(args.model_path)
         elif model_type == 'pt':
-            model = AIPCRerankNet.load_pt(args.model_path, config)
+            # model = AIPCRerankNet.load_pt(args.model_path, config)
+            model = AIPCRerankNet(
+                vocab_size=len(vocab),
+                token_embed_dim=128,
+                precursor_dim=64,
+                hidden_dim=256,
+                n_heads=8,
+                n_layers=2,
+                dropout=0.1,
+                max_token_len=64,
+            )
             model.to(torch.bfloat16)
         else:
             # Assuming a custom function to load from 'bin' format
@@ -319,7 +313,7 @@ def main() -> None:
         file_name = os.path.basename(file_path)[:-len('.parquet')]
         logging.info(f'Parse: {file_path}, file_name: {file_name}')
 
-        # Check if the prediction score file already exists, and skip if it does
+        # 预测之后将结果写入 xx_pred.csv文件。如果该文件已经生成，则不再写入
         out_file = os.path.join(out_path, f"%s_pred.csv" % file_name)
         if os.path.exists(out_file):
             logging.info(f'Output score file: {out_file} exists. Skipping prediction.')
@@ -337,13 +331,23 @@ def main() -> None:
             # Initialize and run the Lightning Trainer for evaluation
             logging.info(f'Total {gpu_num} GPU(s) available ......')
             # Use DDP strategy for multi-GPU prediction
-            strategy = DDPStrategy(gradient_as_bucket_view=True, find_unused_parameters=True)
-            trainer = ptl.Trainer(
-                accelerator="auto",
-                devices="auto",
-                strategy=strategy,
-            )
+            if torch.cuda.is_available():
+                trainer = ptl.Trainer(
+                    accelerator="gpu",
+                    devices=1,
+                )
+            else:
+                trainer = ptl.Trainer(
+                    accelerator="cpu",
+                    devices=1,
+                )
+
+            # Evaluate定义了如何测试。
+            # 需要实现test_step(betch)、on_test_end()函数
             evaluate = Evalute(out_path, file_name, model)
+
+            # trainer是调度器。
+            # 传入evalute对象、DataLoader对象，自动调用test_step
             trainer.test(evaluate, dataloaders=dl)
 
         except Exception as e:
@@ -362,4 +366,5 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-# python3 src.test_model.guanfang_test.py --model_path model/best_full_aux_20260407_v1/best.pt --parquet_dir data/mzml_parquet --out_path data/score
+# python3 src/test_model/guanfang_test.py --model_path model/best_full_aux_20260407_v1/best.pt --parquet_dir data/mzml_parquet --out_path data/score
+# python -m src.test_model.guanfang_test --model_path model/best_full_aux_20260407_v1/best.pt --parquet_dir "E:\AIPC_dataset\bas_test_dataset" --out_path data/score

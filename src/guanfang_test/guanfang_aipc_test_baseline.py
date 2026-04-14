@@ -19,8 +19,8 @@ import lightning.pytorch as ptl
 from lightning.pytorch.strategies import DDPStrategy
 
 # Assuming these are custom modules
-from transformer.dataset import SpectrumDataset, mkdir_p, collate_batch_weight_deltaRT_index
-from transformer.model import MSGPT
+from ..transformer.dataset import SpectrumDataset, mkdir_p, collate_batch_weight_deltaRT_index
+from ..transformer.model import MSGPT
 
 # Configure logger
 logger = logging.getLogger()
@@ -336,4 +336,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-# cd /zhangxiaofan/DDA_BERT_deltaRT/; python aipc_test_baseline.py --model_path /zhangxiaofan/DDA_BERT_deltaRT/pred/mzml_tims_wiff.pt --parquet_dir /zhangxiaofan/DDA_BERT_deltaRT/bohr_test/parquet_dir --out_path /zhangxiaofan/DDA_BERT_deltaRT/bohr_test/score_dir
+# python3 src/guanfang_test/guanfang_aipc_test_baseline.py --model_path model/best_full_aux_20260407_v1/best.pt --parquet_dir data/mzml_parquet --out_path data/score
