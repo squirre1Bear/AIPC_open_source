@@ -4,7 +4,6 @@ import os
 import sys
 import yaml
 import math
-import copy
 import argparse
 import logging
 import warnings
@@ -200,13 +199,11 @@ def extract_state_dict(ckpt):
     elif "model" in ckpt and isinstance(ckpt["model"], dict):
         state_dict = ckpt["model"]
     else:
-        # 直接保存的纯 state_dict
         state_dict = ckpt
 
     if not isinstance(state_dict, dict):
         raise ValueError("Resolved state_dict is not a dict")
 
-    # 去掉 DDP / Lightning 前缀
     cleaned = {}
     for k, v in state_dict.items():
         nk = k
@@ -226,12 +223,46 @@ def build_default_vocab():
     ]
 
 
-def infer_model_hparams_from_state_dict(state_dict: dict, vocab_size: int, config: dict) -> dict:
-    """
-    优先从 config 读取；如果 config 没写，就从权重 shape 猜。
-    """
-    hp = {}
+def infer_n_layers_from_state_dict(state_dict: dict) -> int:
+    token_layer_ids = []
+    spec_layer_ids = []
 
+    for k in state_dict.keys():
+        if k.startswith("token_encoder.layers."):
+            parts = k.split(".")
+            if len(parts) > 2 and parts[2].isdigit():
+                token_layer_ids.append(int(parts[2]))
+
+        if k.startswith("spec_encoder.layers."):
+            parts = k.split(".")
+            if len(parts) > 2 and parts[2].isdigit():
+                spec_layer_ids.append(int(parts[2]))
+
+    max_token_layer = max(token_layer_ids) + 1 if token_layer_ids else 0
+    max_spec_layer = max(spec_layer_ids) + 1 if spec_layer_ids else 0
+
+    inferred = max(max_token_layer, max_spec_layer, 0)
+    if inferred <= 0:
+        inferred = 2
+    return inferred
+
+
+def infer_n_heads_from_state_dict(state_dict: dict, config: dict, hidden_dim: int, token_embed_dim: int) -> int:
+    # 优先从 config 读；没有就兜底 8
+    n_heads = config.get("n_heads", 8)
+
+    # 简单合法性修正，避免 hidden_dim / token_embed_dim 和 n_heads 不整除导致 transformer 初始化异常
+    if hidden_dim % n_heads != 0:
+        for cand in [8, 4, 2, 1]:
+            if hidden_dim % cand == 0 and token_embed_dim % cand == 0:
+                n_heads = cand
+                break
+
+    return n_heads
+
+
+def infer_model_hparams_from_state_dict(state_dict: dict, vocab_size: int, config: dict) -> dict:
+    hp = {}
     hp["vocab_size"] = vocab_size
 
     if "token_embed.weight" in state_dict:
@@ -254,8 +285,13 @@ def infer_model_hparams_from_state_dict(state_dict: dict, vocab_size: int, confi
     else:
         hp["aux_feature_dim"] = config.get("aux_feature_dim", 10)
 
-    hp["n_heads"] = config.get("n_heads", 8)
-    hp["n_layers"] = config.get("n_layers", 2)
+    hp["n_layers"] = infer_n_layers_from_state_dict(state_dict)
+    hp["n_heads"] = infer_n_heads_from_state_dict(
+        state_dict=state_dict,
+        config=config,
+        hidden_dim=hp["hidden_dim"],
+        token_embed_dim=hp["token_embed_dim"],
+    )
     hp["dropout"] = config.get("dropout", 0.1)
     hp["max_token_len"] = config.get("max_token_len", config.get("max_length", 64))
 
@@ -284,6 +320,19 @@ def load_rerank_model(model_path: str, config: dict, device: torch.device) -> AI
     model.eval()
     model.to(device)
     return model
+
+
+def ensure_required_runtime_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    if "weight" not in df.columns:
+        df["weight"] = 1.0
+
+    if "index" not in df.columns:
+        df = df.reset_index(drop=True)
+        df["index"] = np.arange(len(df), dtype=np.int64)
+
+    return df
 
 
 def gen_dl(df, config):
@@ -317,6 +366,8 @@ def postprocess_file(file_path, score_dir):
     score_path = os.path.join(score_dir, file_name + "_pred.csv")
 
     sage_parquet = pd.read_parquet(file_path)
+    sage_parquet = ensure_required_runtime_columns(sage_parquet)
+
     sage_score = pd.read_csv(score_path).drop_duplicates(subset="index")
 
     assert len(sage_parquet) == len(sage_score), (
@@ -414,11 +465,9 @@ def predict_one_file(model, dl, out_path: str, file_name: str, device: torch.dev
         if spectra.size(-1) > 2:
             spectra = spectra[:, :, :2]
 
-        # 如果不小心是 (B, N) 就报错更清晰
         if spectra.dim() != 3 or spectra.size(-1) != 2:
             raise ValueError(f"Expected spectra shape [B, N, 2], got {tuple(spectra.shape)}")
 
-        # precursors 通常保持 float
         spectra = spectra.float()
         precursors = precursors.float()
 
@@ -471,7 +520,6 @@ def main() -> None:
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.load(f.read(), Loader=yaml.FullLoader)
 
-    # 保持和原 baseline 一致的 vocab
     config["vocab"] = build_default_vocab()
     s2i = {v: i for i, v in enumerate(config["vocab"])}
     logging.info(f"Vocab: {s2i}, n_peaks: {config['n_peaks']}")
@@ -509,9 +557,7 @@ def main() -> None:
             df = pd.read_parquet(file_path)
 
             try:
-                if "weight" not in df.columns:
-                    df["weight"] = 1.0
-
+                df = ensure_required_runtime_columns(df)
                 dl = gen_dl(df, config)
                 predict_one_file(model, dl, out_path, file_name, device)
 
@@ -533,11 +579,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-    # python3 - m
-    # src.guanfang_test.guanfang_aipc_test_rerank \
-    # - -model_path
-    # model / best_full_aux_20260407_v1 / best.pt \
-    # - -parquet_dir
-    # data / mzml_parquet \
-    # - -out_path
-    # data / score
+# python3 -m src.guanfang_test.guanfang_aipc_test_baseline --model_path model/best_full_aux_20260407_v1/best.pt --parquet_dir data/bas_test_dataset --out_path data/score
