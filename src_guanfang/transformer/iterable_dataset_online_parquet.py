@@ -299,36 +299,28 @@ def collate_numpy_batch_weight_no_fdr01_target(batch_data):
 
 
 # https://blog.csdn.net/zhang19990111/article/details/131636456
-def create_iterable_dataset(logging,
-                            config,
-                            s2i,
-                            parse='train',
-                            multi_node=False,
-                            need_augment=False,
-                            need_weight=False,
-                            need_unmask=False,
-                            need_no_fdr01_target=False,
-                            seed=123):
-    """
-    Note: If you want to load all data in the memory, please set "read_part" to False.
-    Args:
-        :param logging: out logging.
-        :param config: data from the yaml file.
-        :param s2i: vocab.
-        :param buffer_size: An integer. the size of file_name buffer.
-    :return:
-    """
-    # update gpu_num
+def create_iterable_dataset(
+    logging,
+    config,
+    s2i,
+    parse='train',
+    multi_node=False,
+    need_augment=False,
+    need_weight=False,
+    need_unmask=False,
+    need_no_fdr01_target=False,
+    seed=123
+):
     if multi_node:
         gpu_num = int(config['gpu_num'])
     else:
         gpu_num = torch.cuda.device_count() if torch.cuda.is_available() else 1
-        
-    # logging.info(f"******************multi_node: {multi_node}, need_weight: {need_weight}, need_unmask: {need_unmask},  need_no_fdr01_target: {need_no_fdr01_target}, gpu_num: {gpu_num};**********")
-    logging.info(f"******************multi_node: {multi_node}, need_augment: {need_augment}, gpu_num: {gpu_num};**********")
+
+    logging.info(
+        f"******************multi_node: {multi_node}, need_augment: {need_augment}, gpu_num: {gpu_num};**********"
+    )
 
     if parse == 'train':
-        # 训练阶段
         if ';' in config['train_path']:
             total_train_path = config['train_path'].split(';')
             data_file_list = []
@@ -340,214 +332,197 @@ def create_iterable_dataset(logging,
         else:
             data_file_list = glob.glob(f"{config['train_path']}/*pkl")
             logging.info(f"******************{parse} {config['train_path']}, loaded: {len(data_file_list)};**********")
-        
-        random.shuffle(data_file_list)
+
         data_file_list = shuffle_file_list(data_file_list, config['seed'])
-        
-        # 按照gpu_num数量，对数据集截断
-        # if multi_node:
+
         file_bin_num = len(data_file_list) // gpu_num
         file_truncation_num = file_bin_num * gpu_num
         data_file_list = data_file_list[:file_truncation_num]
-        # data_file_list = data_file_list[:1000] # debug
 
-        train_dl = IterableDiartDataset(data_file_list,
-                                        config["train_batch_size"],
-                                        s2i, # vocab
-                                        max_length=config["max_length"], # 序列最大长度
-                                        buffer_size=config["buffer_size"], # 蓄水池深度
-                                        gpu_num=gpu_num,
-                                        shuffle=True,
-                                        multi_node=multi_node,
-                                        need_augment=need_augment,
-                                        need_weight=need_weight,
-                                        need_unmask=need_unmask,
-                                        need_no_fdr01_target=need_no_fdr01_target,
-                                        seed=config['seed'])
-        logging.info(f"Data loaded: {len(train_dl) * config['train_batch_size']:,} training samples")
+        dataset = IterableDiartDataset(
+            data_file_list,
+            config["train_batch_size"],
+            s2i,
+            max_length=config["max_length"],
+            buffer_size=config["buffer_size"],
+            gpu_num=gpu_num,
+            shuffle=True,
+            multi_node=multi_node,
+            need_augment=need_augment,
+            need_weight=need_weight,
+            need_unmask=need_unmask,
+            need_no_fdr01_target=need_no_fdr01_target,
+            seed=config['seed'],
+        )
+
+        if need_no_fdr01_target:
+            collate_fn = collate_numpy_batch_weight_no_fdr01_target
+        elif need_unmask:
+            collate_fn = collate_numpy_batch_weight_unmask
+        elif need_weight:
+            collate_fn = collate_numpy_batch_weight
+        else:
+            collate_fn = collate_numpy_batch
+
+        train_dl = DataLoader(
+            dataset,
+            batch_size=config["train_batch_size"],
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=True,
+            collate_fn=collate_fn,
+            drop_last=True,
+            prefetch_factor=4,
+        )
+
+        logging.info(f"Data loaded: {len(dataset):,} training samples")
         return train_dl
+
     else:
-        # 验证阶段
         data_file_list = glob.glob(f"{config['valid_path']}/*pkl")
         logging.info(f"******************{parse} loaded: {len(data_file_list)};**********")
-        
-        val_dl = IterableDiartDataset(data_file_list,
-                                      config["predict_batch_size"],
-                                      s2i, # vocab
-                                      max_length=config["max_length"], # 序列最大长度
-                                      gpu_num=gpu_num,
-                                      shuffle=False,
-                                      multi_node=multi_node,
-                                      need_augment=need_augment,
-                                      need_weight=need_weight,
-                                      need_unmask=need_unmask,
-                                      need_no_fdr01_target=need_no_fdr01_target)
-        logging.info(f"{len(val_dl) * config['predict_batch_size']:,} validation samples")
+
+        dataset = IterableDiartDataset(
+            data_file_list,
+            config["predict_batch_size"],
+            s2i,
+            max_length=config["max_length"],
+            gpu_num=gpu_num,
+            shuffle=False,
+            multi_node=multi_node,
+            need_augment=need_augment,
+            need_weight=need_weight,
+            need_unmask=need_unmask,
+            need_no_fdr01_target=need_no_fdr01_target,
+            seed=config['seed'],
+        )
+
+        if need_no_fdr01_target:
+            collate_fn = collate_numpy_batch_weight_no_fdr01_target
+        elif need_unmask:
+            collate_fn = collate_numpy_batch_weight_unmask
+        elif need_weight:
+            collate_fn = collate_numpy_batch_weight
+        else:
+            collate_fn = collate_numpy_batch
+
+        val_dl = DataLoader(
+            dataset,
+            batch_size=config["predict_batch_size"],
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=True,
+            collate_fn=collate_fn,
+            drop_last=False,
+            prefetch_factor=4,
+        )
+
+        logging.info(f"{len(dataset):,} validation samples")
         return val_dl
 
 
 class IterableDiartDataset(IterableDataset):
-    """
-    Custom dataset class for dataset in order to use efficient
-    dataloader tool provided by PyTorch.
-    """
-
-    def __init__(self,
-                 file_list: list,
-                 batch_size,
-                 s2i, # vocab
-                 max_length=50,
-                 buffer_size=1,
-                 gpu_num=1,
-                 shuffle=False,
-                 multi_node=False,
-                 need_weight=False,
-                 need_unmask=False,
-                 need_no_fdr01_target=False,
-                 need_augment=False,
-                 seed=0,
-                 bath_file_size=1,
-                 **kwargs):
-        super(IterableDiartDataset).__init__()
-        # 文件列表
+    def __init__(
+        self,
+        file_list: list,
+        batch_size,
+        s2i,
+        max_length=50,
+        buffer_size=1,
+        gpu_num=1,
+        shuffle=False,
+        multi_node=False,
+        need_weight=False,
+        need_unmask=False,
+        need_no_fdr01_target=False,
+        need_augment=False,
+        seed=0,
+        **kwargs
+    ):
+        super().__init__()
         self.file_list = file_list
         self.batch_size = batch_size
         self.s2i = s2i
         self.max_length = max_length
-
         self.shuffle = shuffle
         self.seed = seed
         self.epoch = 0
-        
-        # 单次抽样的文件大小
-        self.bath_file_size = bath_file_size
         self.buffer_size = buffer_size
-
         self.gpu_num = gpu_num
         self.multi_node = multi_node
         self.need_augment = need_augment
         self.need_weight = need_weight
         self.need_unmask = need_unmask
         self.need_no_fdr01_target = need_no_fdr01_target
-        
-    def parse_file(self, file_name):
-        # 加载pkl
-        f = open(file_name, "rb")
-        ds = pickle.loads(f.read())
-        # print('file_name: ', file_name, 'ds: ', ds.keys(), 'fdr: ', ds['fdr'].shape, 'need_fdr:', self.need_fdr, flush=True)
-        f.close()
 
-        if self.need_augment:
-            dpt = dict2pt_weight(ds, self.s2i, self.max_length)
-            return DataLoader(dpt,
-                              batch_size=self.batch_size,
-                              shuffle=self.shuffle,
-                              collate_fn=collate_numpy_batch_weight_augment,
-                              num_workers=2,
-                              drop_last=True,
-                              pin_memory=True)
-        
-        elif self.need_no_fdr01_target:
+    def _get_rank(self):
+        if self.gpu_num > 1:
+            if self.multi_node:
+                return int(os.environ.get("RANK", 0))
+            else:
+                return int(os.environ.get("LOCAL_RANK", 0))
+        return 0
+
+    def _get_sharded_files(self):
+        rank = self._get_rank()
+        if self.gpu_num > 1:
+            return self.file_list[rank::self.gpu_num]
+        return self.file_list
+
+    def _load_file(self, file_name):
+        with open(file_name, "rb") as f:
+            ds = pickle.loads(f.read())
+
+        if self.need_no_fdr01_target:
             dpt = dict2pt_weight_no_fdr01_target(ds, self.s2i, self.max_length)
-            return DataLoader(dpt,
-                              batch_size=self.batch_size,
-                              shuffle=self.shuffle,
-                              collate_fn=collate_numpy_batch_weight_no_fdr01_target,
-                              num_workers=2,
-                              drop_last=True,
-                              pin_memory=True)
         elif self.need_unmask:
             dpt = dict2pt_weight_unmask(ds, self.s2i, self.max_length)
-            return DataLoader(dpt,
-                              batch_size=self.batch_size,
-                              shuffle=self.shuffle,
-                              collate_fn=collate_numpy_batch_weight_unmask,
-                              num_workers=2,
-                              drop_last=True,
-                              pin_memory=True)
         elif self.need_weight:
             dpt = dict2pt_weight(ds, self.s2i, self.max_length)
-            return DataLoader(dpt,
-                              batch_size=self.batch_size,
-                              shuffle=self.shuffle,
-                              collate_fn=collate_numpy_batch_weight,
-                              num_workers=2,
-                              drop_last=True,
-                              pin_memory=True)
         else:
             dpt = dict2pt(ds, self.s2i, self.max_length)
-            return DataLoader(dpt,
-                              batch_size=self.batch_size,
-                              shuffle=self.shuffle,
-                              collate_fn=collate_numpy_batch,
-                              num_workers=2,
-                              drop_last=True,
-                              pin_memory=True)
-
-    def file_mapper(self, file_list):
-        idx = 0
-        file_num = len(file_list)
-        while idx < file_num:
-            yield self.parse_file(file_list[idx])
-            idx += 1
+        return dpt
 
     def __iter__(self):
-        if self.gpu_num > 1:
-            if self.multi_node:# 多机多卡
-                if 'RANK' in os.environ:
-                    rank = int(os.environ['RANK'])
-                else:
-                    rank = 0
-            else:# 单机多卡
-                if 'LOCAL_RANK' in os.environ:
-                    rank = int(os.environ['LOCAL_RANK'])
-                else:
-                    rank = 0
-            
-            file_itr = self.file_list[rank::self.gpu_num]
-            # print('rank: ', rank, 'file_itr', file_itr[0], flush=True)
-            
-        else:
-            # 单卡
-            file_itr = self.file_list
-
-        file_mapped_itr = self.file_mapper(file_itr)
+        files = self._get_sharded_files()
 
         if self.shuffle:
-            return self._shuffle(file_mapped_itr)
-        else:
-            return file_mapped_itr
+            rng = random.Random(self.seed + self.epoch)
+            files = files.copy()
+            rng.shuffle(files)
+
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            files = files[worker_id::num_workers]
+
+        for file_name in files:
+            dpt = self._load_file(file_name)
+            indices = list(range(len(dpt)))
+
+            if self.shuffle:
+                rng = random.Random(self.seed + self.epoch + hash(file_name) % 100000)
+                rng.shuffle(indices)
+
+            for idx in indices:
+                item = dpt[idx]
+                if self.need_augment:
+                    # 不改变输出结构，仅对 spectra 做增强
+                    item = dict(item)
+                    spectra = torch.tensor(item["spectra"], dtype=torch.float)
+                    item["spectra"] = augment_spectrum(spectra).cpu().numpy()
+                yield item
 
     def __len__(self):
-        if self.gpu_num > 1:
-            return math.ceil(len(self.file_list) / self.gpu_num)
-        else:
-            return len(self.file_list)
-        
+        files_per_rank = math.ceil(len(self.file_list) / max(self.gpu_num, 1))
+        # 每文件 256 行；如果以后不固定，可改成扫描一次缓存元信息
+        return files_per_rank * 256
+
     def set_epoch(self, epoch):
         self.epoch = epoch
-
-    def generate_random_num(self):
-        while True:
-            random.seed(self.epoch + self.seed)
-            random_nums = random.sample(range(self.buffer_size), self.bath_file_size)
-            yield from random_nums
-
-    # 蓄水池抽样（每个数据都是以m/N的概率获得的）
-    def _shuffle(self, mapped_itr):
-        buffer = []
-        for dt in mapped_itr:
-            # 如果接收的数据量小于m，则依次放入蓄水池。
-            if len(buffer) < self.buffer_size:
-                buffer.append(dt)
-            # 当接收到第i个数据时，i >= m，在[0, i]范围内取以随机数d。
-            # 若d的落在[0, m-1]范围内，则用接收到的第i个数据替换蓄水池中的第d个数据。
-            else:
-                i = next(self.generate_random_num())
-                yield buffer[i]
-                buffer[i] = dt
-        random.shuffle(buffer)
-        yield from buffer
 
 def aa_tokenize(sequence, s2i, max_length):
     """Transform a peptide sequence into tokens

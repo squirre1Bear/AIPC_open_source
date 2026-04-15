@@ -1,5 +1,4 @@
-import torch
+import pandas as pd
 
-print(torch.cuda.is_available())      # 是否可用
-print(torch.cuda.device_count())      # GPU 数量
-print(torch.cuda.get_device_name(0))  # 第 1 张 GPU 名称
+df = pd.read_parquet('./data_guanfang/mzml_parquet/part.00000.parquet')
+print(df.columns.tolist())
