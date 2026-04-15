@@ -74,4 +74,4 @@ train_step_ratio: 0.9 # tensorboard monitor ratio of train phase
 val_step_ratio: 0.8 # tensorboard monitor ratio of val phase
 
 logger:
-epochs: 40
+epochs: 1
