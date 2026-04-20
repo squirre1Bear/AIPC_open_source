@@ -49,8 +49,8 @@ residues:
 
 n_log: 1
 # input params
-train_path: "E:/AIPC_dataset/ms_data_pkl"
-valid_path: "E:/AIPC_dataset/ms_data_pkl"
+train_path: "data/mzml_pkl"
+valid_path: "data/mzml_pkl"
 init_model_path: ''
 
 # out params

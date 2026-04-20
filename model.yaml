@@ -49,14 +49,14 @@ residues:
 
 n_log: 1
 # input params
-train_path: "E:/AIPC_dataset/ms_data_pkl"
-valid_path: "E:/AIPC_dataset/ms_data_pkl"
+train_path: "./data/mzml_pkl"
+valid_path: "./data/mzml_pkl"
 init_model_path: ''
 
 # out params
-tb_summarywriter: "D:/Python_Projects/pfind_AIPC/logs"
-model_save_path: "D:/Python_Projects/pfind_AIPC/model/checkpoints"
-out_path: "D:/Python_Projects/pfind_AIPC"
+tb_summarywriter: "./logs"
+model_save_path: "./model/checkpoints"
+out_path: "."
 
 warmup_ratio: 0.2 # warmup ratio of max_iters
 learning_rate: 5e-5
@@ -74,4 +74,3 @@ val_step_ratio: 0.8 # tensorboard monitor ratio of val phase
 
 logger:
 epochs: 25
-

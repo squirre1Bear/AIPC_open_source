@@ -19,3 +19,6 @@ xgboost==2.1.4
 dask~=2026.3.0
 transformers
 lightning
+tensorboard
+mpi4py
+deepspeeed

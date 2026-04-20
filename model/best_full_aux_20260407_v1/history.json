@@ -1,0 +1,41 @@
+[
+  {
+    "epoch": 1,
+    "train_loss": 0.26446020997633507,
+    "val_loss": 0.24295524360254558,
+    "val_acc": 0.9015013415404041,
+    "val_roc_auc": 0.9537067448480625,
+    "val_pr_auc": 0.9658510593119902,
+    "val_targets_at_fdr01": 404189,
+    "val_unique_peptides_at_fdr01": 121810,
+    "lr": 0.000375,
+    "seconds": 980.6274099349976,
+    "world_size": 4
+  },
+  {
+    "epoch": 2,
+    "train_loss": 0.23645801863731028,
+    "val_loss": 0.22487259956471847,
+    "val_acc": 0.9088235874368686,
+    "val_roc_auc": 0.9602650572008116,
+    "val_pr_auc": 0.9702360473978973,
+    "val_targets_at_fdr01": 411612,
+    "val_unique_peptides_at_fdr01": 123214,
+    "lr": 0.00012500000000000006,
+    "seconds": 976.2567133903503,
+    "world_size": 4
+  },
+  {
+    "epoch": 3,
+    "train_loss": 0.2247030398833237,
+    "val_loss": 0.21599006029692563,
+    "val_acc": 0.9129626341540404,
+    "val_roc_auc": 0.9632399149530273,
+    "val_pr_auc": 0.9723827004802272,
+    "val_targets_at_fdr01": 416360,
+    "val_unique_peptides_at_fdr01": 126089,
+    "lr": 0.0,
+    "seconds": 976.1054615974426,
+    "world_size": 4
+  }
+]
