@@ -555,6 +555,14 @@ def main():
             continue
 
     logging.info('Finished Training')
+    if int(os.environ.get('RANK', 0)) == 0:
+        logging.info(f"Saving final model to {config['model_save_path']}")
+        save_checkpoint(
+            model_engine,
+            save_dir=config["model_save_path"],
+            tag="final",
+            client_state={'epoch': config['epochs']}
+        )
 
 
 # run

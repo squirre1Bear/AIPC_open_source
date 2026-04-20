@@ -72,5 +72,5 @@ def main():
 if __name__ == "__main__":
     main()
 
-# python /zhangxiaofan/DDA_BERT_deltaRT/aipc_generate_submit_251204.py --dir /zhangxiaofan/DDA_BERT_deltaRT/pred/test_251204/adv_result --output /zhangxiaofan/DDA_BERT_deltaRT/pred/test_251204/adv_submit.tsv --type advanced
+# python3 ./src/test_model/aipc_generate_submit.py --dir ./data/bas_test_score --output ./data/bas_test_score/bas_submit.tsv --type basic
 # python /zhangxiaofan/DDA_BERT_deltaRT/aipc_generate_submit_251204.py --dir /zhangxiaofan/DDA_BERT_deltaRT/pred/test_251204/bas_result --output /zhangxiaofan/DDA_BERT_deltaRT/pred/test_251204/bas_submit.tsv --type basic

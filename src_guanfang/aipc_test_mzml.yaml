@@ -67,11 +67,11 @@ warmup_strategy: 'exp' # exp or cos
 seed: 123
 
 # Training/inference options
-train_batch_size: 32 # the batch size of train phase
-predict_batch_size: 64 # the batch size of val phase
+train_batch_size: 200 # the batch size of train phase
+predict_batch_size: 512 # the batch size of val phase
 buffer_size: 2 # 2000 # the buffer size of cistern
 train_step_ratio: 0.9 # tensorboard monitor ratio of train phase
 val_step_ratio: 0.8 # tensorboard monitor ratio of val phase
 
 logger:
-epochs: 1
+epochs: 10

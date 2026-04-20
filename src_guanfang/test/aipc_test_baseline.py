@@ -134,7 +134,6 @@ def gen_dl(df, config):
     
     # Initialize the Dataset with necessary flags (label, weight, deltaRT, index)
     ds = SpectrumDataset(df, s2i, config["n_peaks"], need_label=True, need_weight=True, need_deltaRT=True, need_index=True)
-    
     # Initialize the DataLoader
     dl = DataLoader(ds,
                     batch_size=config["predict_batch_size"],
@@ -152,7 +151,18 @@ def postprocess_file(file_path, score_dir):
 
     # 读原始Parquet数据，和.csv的分数文件
     sage_parquet = pd.read_parquet(file_path)
-    sage_score = pd.read_csv(score_path).drop_duplicates(subset='index') 
+    sage_score = pd.read_csv(score_path).drop_duplicates(subset='index')
+
+    sage_score = pd.read_csv(score_path)
+
+    # 强制数值化，过滤掉重复表头/脏数据
+    sage_score["index"] = pd.to_numeric(sage_score["index"], errors="coerce")
+    sage_score["score"] = pd.to_numeric(sage_score["score"], errors="coerce")
+    sage_score = sage_score.dropna(subset=["index", "score"])
+    sage_score["index"] = sage_score["index"].astype(int)
+
+    sage_score = sage_score.drop_duplicates(subset="index")
+
 
     # Sanity check for data consistency
     assert len(sage_parquet) == len(sage_score), f"{file_name}: parquet length ({len(sage_parquet)}) and score length ({len(sage_score)}) are inconsistent"
@@ -172,7 +182,7 @@ def postprocess_file(file_path, score_dir):
         # Calculate q-values
         df = get_fdr_result(df)
         # Filter PSMs where q_value is less than 1.0 (retains all PSMs that passed the FDR check)
-        df = df[df['q_value'] < 0.009]
+        df = df[df['q_value'] < 1]
         return df
 
     sage_parquet = _post(sage_parquet)
@@ -239,7 +249,7 @@ def main() -> None:
     parser.add_argument("--out_path", default='') # If empty, output path is same as input; otherwise, use the specified path
     args = parser.parse_args()
 
-    # Load model and config
+    # 加载模型
     logging.info(f"Inference use model path: {args.model_path}")
     model_type = args.model_path.split('.')[-1]
     
@@ -248,7 +258,7 @@ def main() -> None:
         with open(args.config, 'r', encoding='utf-8') as f:
             config = yaml.load(f.read(), Loader=yaml.FullLoader)
         
-        # Define the fixed vocabulary
+        # 初始化词表
         vocab = ['<pad>', '<mask>', 'A', 'D', 'E', 'F', 'G', 'H', 'I', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'Y', 'C[57.02]', 'M[15.99]', 'N[.98]', 'Q[.98]', 'X', '<unk>']
         config["vocab"] = vocab
         s2i = {v: i for i, v in enumerate(vocab)}
@@ -271,7 +281,7 @@ def main() -> None:
         f"Model loaded with {np.sum([p.numel() for p in model.parameters()]):,d} parameters"
     )
 
-    # Set model to evaluation mode and map to device
+    # 调为评估模式，并放到device上
     model.eval()
     model = model.to(torch.bfloat16) # Map model weights to bfloat16
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -294,7 +304,7 @@ def main() -> None:
     
     # Load data file paths
     data_path_list = [os.path.join(args.parquet_dir, f) for f in os.listdir(args.parquet_dir) if f.endswith('.parquet')]
-    
+
     for file_path in data_path_list:
         file_name = os.path.basename(file_path)[:-len('.parquet')]
         logging.info(f'Parse: {file_path}, file_name: {file_name}')
@@ -317,12 +327,16 @@ def main() -> None:
             # Initialize and run the Lightning Trainer for evaluation
             logging.info(f'Total {gpu_num} GPU(s) available ......')
             # Use DDP strategy for multi-GPU prediction
-            strategy = DDPStrategy(gradient_as_bucket_view=True, find_unused_parameters=True)
             trainer = ptl.Trainer(
-                accelerator="auto",
-                devices="auto",
-                strategy=strategy,
+                accelerator="gpu" if torch.cuda.is_available() else "cpu",
+                devices=1,
             )
+            # strategy = DDPStrategy(gradient_as_bucket_view=True, find_unused_parameters=True)
+            # trainer = ptl.Trainer(
+            #     accelerator="auto",
+            #     devices="auto",
+            #     strategy=strategy,
+            # )
             evaluate = Evalute(out_path, file_name, model)
             trainer.test(evaluate, dataloaders=dl)
             
