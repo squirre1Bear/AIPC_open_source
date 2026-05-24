@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="6e7a046f-5d81-4b36-a8fa-ead64de127e1" name="root@region-42.seetacloud.com:55335 password">
+        <fileTransfer accessType="SFTP" host="region-42.seetacloud.com" port="55335" sshConfigId="98298237-7c19-48de-bc30-7ddcfb09accc" sshConfig="root@region-42.seetacloud.com:55335 password" />
+      </webServer>
+      <webServer id="e202e5f7-a82f-41b9-bbf8-428ef547e1fd" name="2080Ti">
+        <fileTransfer rootFolder="/home/yhc" accessType="SFTP" host="10.156.233.12" port="22" sshConfigId="6262be29-d9c1-4d37-991f-cb4a3eff7c76" sshConfig="yhc@10.156.233.12:22 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>
