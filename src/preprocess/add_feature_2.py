@@ -2,7 +2,10 @@
 from pathlib import Path
 from tqdm import tqdm
 import polars as pl
+import numpy as np
+import re
 from collections import OrderedDict
+import math
 
 PROCESSED_DIRS = [
     Path(r"E:\AIPC_dataset\processed\mzml_merged"),
@@ -149,6 +152,19 @@ FRAGMENT_FEATURE_NAMES = [
     "loss_explained_intensity_fraction_20ppm",
 ]
 
+def safe_float(x, default=0.0):
+    try:
+        if x is None:
+            return default
+
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
+
+    except Exception:
+        return default
+
 # LRU 缓存，避免重复解析肽段或谱图
 class LRUCache:
     def __init__(self, max_size=4096):
@@ -169,6 +185,155 @@ class LRUCache:
         elif len(self.data) >= self.max_size:
             self.data.popitem(last=False)  # last=False表示先删除最前面的，也就是最久没有使用的
         self.data[key] = value
+
+def preprocess_spectrum(mz_array, intensity_array):
+    # 转为 numpy 数组
+    mz = np.asarray(mz_array, dtype=np.float64)
+    intensity = np.asarray(intensity_array, dtype=np.float64)
+
+    # 谱图为空，或是强度、质荷比无法一一对应
+    if (mz_array is None or intensity_array is None) or (len(mz) == 0 or len(intensity) == 0 or len(mz) != len(intensity)):
+        return {
+            "mz": np.asarray([], dtype=np.float64),
+            "intensity": np.asarray([], dtype=np.float64),
+            "rank": np.asarray([], dtype=np.int32),
+            "total_intensity": 0.0,
+            "top50_total_intensity": 0.0,
+        }
+
+    # 过滤谱图中的非法值和0
+    mask = (
+        np.isfinite(mz)
+        & np.isfinite(intensity)
+        & (mz > 0)
+        & (intensity > 0)
+    )
+
+    mz = mz[mask]
+    intensity = intensity[mask]
+
+    # 过滤后谱图为空
+    if len(mz) == 0:
+        return {
+            "mz": np.asarray([], dtype=np.float64),
+            "intensity": np.asarray([], dtype=np.float64),
+            "rank": np.asarray([], dtype=np.int32),
+            "total_intensity": 0.0,
+            "top50_total_intensity": 0.0,
+        }
+
+    # 按 mz 从小到大对 mz、intensity 重排序
+    order_mz = np.argsort(mz)
+    mz = mz[order_mz]
+    intensity = intensity[order_mz]
+
+    # 峰强度 从大到小 排序
+    order_intensity = np.argsort(-intensity)
+    rank = np.empty(len(intensity), dtype=np.int32)
+    rank[order_intensity] = np.arange(1, len(order_intensity) + 1, dtype=np.int32)
+
+    # 总强度
+    total_intensity = float(np.sum(intensity))
+    top50_total_intensity = float(np.sum(intensity[rank <= 50]))
+
+    return {
+        "mz": mz,
+        "intensity": intensity,
+        "rank": rank,
+        "total_intensity": total_intensity,
+        "top50_total_intensity": top50_total_intensity
+    }
+
+# 标准化修饰的名称
+def normalize_mod_name(name):
+    name = str(name).strip()    # 去掉首尾空格
+    name = name.lower()
+    name = name.replace("_", "")
+    name = name.replace(" ", "")
+    return name
+
+# 根据修饰名中的数字提取质量
+def parse_numeric_mass(text):
+    text = str(text).strip()
+
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+    # 如果没有匹配到数字，m 会是 None。
+    if m is None:
+        return None
+    return safe_float(m.group(0), default=None)
+
+# 根据修饰文本获取质量偏移
+def get_mod_delta(mod):
+    if mod is None:
+        return None
+
+    # 标准化名称，统一大小写、下划线等
+    key = normalize_mod_name(mod)
+
+    if key in MOD_MASS:
+        return MOD_MASS[key]
+
+    # 如果修饰不在字典中，尝试从修饰名中提取质量
+    # 如 [+15.9949] [mass=57.02]
+    return
+
+# 肽段解析，返回氨基酸序列 + 每个残基质量
+def parse_peptide_to_residue_masses(seq):
+    if seq is None or str(seq).strip() == "":
+        return [], [], 0
+
+    s = str(seq).strip()
+    # K.PEPTIDE.R 的情况，中间部分是真正的肽段
+    if s.count(".") == 2:
+        s = s.split(".")[1]
+
+    aa_list = []
+    masses = []    # 记录残基质量
+    parse_ok = 1    # 记录是否解析成功
+    pending_nterm_delta = 0.0  # 记录 n 端修饰的质量
+
+    i = 0
+    while i < len(s):
+        ch = s[i]
+
+        # 情况1：当前字符是修饰的左括号
+        if ch in ["{", "[", "("]:
+            open_ch = ch
+
+            # 找到对应的右括号
+            close_ch = {"{": "}", "[": "]", "(": ")"}[open_ch]
+            j = s.find(close_ch, i+1)
+
+            # 没找到右括号，格式有误。跳过该字符
+            if j == -1:
+                parse_ok = 0
+                i += 1
+                continue
+
+            # 取出括号内的修饰
+            mod_text = s[i+1: j]
+            # 获取修饰质量偏移
+            delta = get_mod_delta(mod_text)
+
+
+
+
+
+# 生成理论b y 离子
+def build_theoretical_b_y_ions(seq, precursor_chage):
+
+
+# 计算 PSM 的片段特征
+def compute_fragment_features(seq, charge, spec, theo_cache):
+
+    key = (str(seq), int(charge) if charge is not None else 1)
+
+    # 尝试从缓存取出理论离子
+    theo = theo_cache.get(key)
+    if theo is None:
+        theo = build_theoretical_ions(seq, charge)
+        theo_cache.put(key, theo)
+
 
 def add_fragment_feature(path: Path):
     schema_cols = pl.scan_parquet(path).collect_schema().names()
@@ -201,6 +366,27 @@ def add_fragment_feature(path: Path):
 
     # 存放新增特征的数据
     feature_data = {name: [] for name in FRAGMENT_FEATURE_NAMES}
+
+    iter_df = df.select([
+        "group_key",
+        "precursor_sequence",
+        "charge",
+        "mz_array",
+        "intensity_array",
+    ])
+    for row in tqdm(iter_df.iter_rows(named=True), total=df.height):
+        group_key = row["group_key"]
+
+        # 当前 PSM 对应的谱图可能已被处理过，先查缓存
+        spec = spec_cache.get(group_key)
+        if spec is None:
+            # 获取处理后的谱图
+            spec = preprocess_spectrum(row["mz_array"], row["intensity_array"])
+            spec_cache.put(group_key, spec)
+
+
+
+
 
 
 

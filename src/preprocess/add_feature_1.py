@@ -1,11 +1,18 @@
 # 添加前体质量相关特征、RT 归一化等
 from pathlib import Path
 
+import os
+os.environ.setdefault("POLARS_MAX_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+import sys
+import subprocess
 import numpy as np
 from tqdm import tqdm
 import math
 import polars as pl
-import os
 import re
 import gc
 
@@ -24,6 +31,11 @@ TMP_SUFFIX = ".tmp_feature.parquet"
 
 # 每张谱图保留 TOPK_PEAKS 个峰
 TOPK_PEAKS = 500
+
+# 稳定模式：每个 parquet 文件放到独立子进程处理。
+# 这样即使 Polars / Arrow 底层因为内存压力崩溃，也不会拖死整个任务，
+# 并且每个文件处理完后操作系统会彻底回收内存。
+RUN_EACH_FILE_IN_SUBPROCESS = True
 
 # 只读取本脚本需要的列，避免把 parquet 里的无关列全部读进内存
 NEEDED_COLS = [
@@ -371,6 +383,86 @@ def cast_existing(df: pl.DataFrame, casts: dict) -> pl.DataFrame:
     return df
 
 
+def is_valid_parquet_file(path: Path) -> bool:
+    """快速检查 parquet 文件头尾，避免把半写入文件覆盖原文件。"""
+    try:
+        if not path.exists() or path.stat().st_size < 8:
+            return False
+
+        with open(path, "rb") as f:
+            head = f.read(4)
+            f.seek(-4, os.SEEK_END)
+            tail = f.read(4)
+
+        return head == b"PAR1" and tail == b"PAR1"
+
+    except Exception:
+        return False
+
+
+def cleanup_tmp_file(tmp_path: Path):
+    """失败时尽量清理临时 parquet，避免下次把坏 tmp 文件也扫进去。"""
+    try:
+        if tmp_path.exists():
+            tmp_path.unlink()
+            print(f"已删除临时文件：{tmp_path}")
+    except Exception as e:
+        print(f"临时文件删除失败：{tmp_path}，错误：{e}")
+
+
+def build_unique_spectrum_safe(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    替代 Polars map_elements + Struct[List] 的写法。
+
+    原写法在大 List 列上会制造很高的内存峰值，并且在 Windows 上有概率触发
+    Polars/Arrow 底层 0xC0000005 崩溃。这里保留同样逻辑：每个 group_key 只
+    裁剪一次谱图，然后再 join 回原 df。
+    """
+    unique_spectrum_raw = (
+        df
+        .select(["group_key", "mz_array", "intensity_array"])
+        .unique(["group_key"], keep="first")
+    )
+
+    group_dtype = unique_spectrum_raw.schema["group_key"]
+
+    group_keys = []
+    mz_lists = []
+    intensity_lists = []
+
+    for row in unique_spectrum_raw.iter_rows(named=True):
+        new_mz, new_intensity = keep_topk_peaks(
+            row["mz_array"],
+            row["intensity_array"],
+            TOPK_PEAKS,
+        )
+
+        group_keys.append(row["group_key"])
+        mz_lists.append(new_mz)
+        intensity_lists.append(new_intensity)
+
+    del unique_spectrum_raw
+    gc.collect()
+
+    unique_spectrum = pl.DataFrame(
+        {
+            "group_key": group_keys,
+            "mz_array": mz_lists,
+            "intensity_array": intensity_lists,
+        },
+        schema={
+            "group_key": group_dtype,
+            "mz_array": pl.List(pl.Float32),
+            "intensity_array": pl.List(pl.Float32),
+        },
+    )
+
+    del group_keys, mz_lists, intensity_lists
+    gc.collect()
+
+    return unique_spectrum
+
+
 def add_feature_1(path: Path):
     print(f"正在处理 {path}")
 
@@ -405,37 +497,7 @@ def add_feature_1(path: Path):
     # 每一个 group_key 只保留一次，避免对同一张谱图的多条 PSM 重复裁剪
     # 这里避免手动 rows.append(...) 生成巨大 Python 列表
 
-    unique_spectrum = (
-        df
-        .select(["group_key", "mz_array", "intensity_array"])
-        .unique(["group_key"], keep="first")
-        .with_columns(
-            pl.struct(["mz_array", "intensity_array"])
-            .map_elements(
-                trim_spectrum_struct,
-                return_dtype=pl.Struct({
-                    # trim_spectrum_struct 返回的是 Python list[float]，
-                    # Polars 会识别为 List(Float64)，因此这里先写 Float64。
-                    "mz_array": pl.List(pl.Float64),
-                    "intensity_array": pl.List(pl.Float64),
-                })
-            )
-            .alias("trimmed")
-        )
-        .select([
-            "group_key",
-
-            pl.col("trimmed")
-            .struct.field("mz_array")
-            .cast(pl.List(pl.Float32))
-            .alias("mz_array"),
-
-            pl.col("trimmed")
-            .struct.field("intensity_array")
-            .cast(pl.List(pl.Float32))
-            .alias("intensity_array"),
-        ])
-    )
+    unique_spectrum = build_unique_spectrum_safe(df)
 
     df = (
         df
@@ -659,7 +721,7 @@ def add_feature_1(path: Path):
         pl.col("ion_mobility").std().alias("im_std"),
         pl.col("ion_mobility").quantile(0.01).alias("im_p01"),
         pl.col("ion_mobility").quantile(0.99).alias("im_p99"),
-    ]).to_dicts()[0]
+    ]).row(0, named=True)
 
     rt_mean = safe_float(stats["rt_mean"], 0.0)
     rt_std = safe_float(stats["rt_std"], 0.0)
@@ -828,6 +890,9 @@ def add_feature_1(path: Path):
 
     tmp_path = path.with_name(path.name + TMP_SUFFIX)
 
+    # 如果上一次异常退出留下了旧 tmp，先删除，避免误用半写入文件。
+    cleanup_tmp_file(tmp_path)
+
     df = df.with_columns([
         pl.lit(1).cast(pl.Int8).alias("aux_feature_done")
     ])
@@ -835,24 +900,42 @@ def add_feature_1(path: Path):
     row_count = df.height
     col_count = len(df.columns)
 
-    df.write_parquet(tmp_path)
+    df_deleted = False
 
-    # 写完后尽早释放 df
-    del df
-    gc.collect()
+    try:
+        df.write_parquet(tmp_path)
 
-    if MAKE_BACKUP:
-        backup_path = path.with_name(path.name + ".bak")
+        if not is_valid_parquet_file(tmp_path):
+            raise RuntimeError(f"临时 parquet 写入不完整：{tmp_path}")
 
-        if not backup_path.exists():
-            os.replace(path, backup_path)
+        # 写完后尽早释放 df
+        del df
+        df_deleted = True
+        gc.collect()
+
+        if MAKE_BACKUP:
+            backup_path = path.with_name(path.name + ".bak")
+
+            if not backup_path.exists():
+                os.replace(path, backup_path)
+            else:
+                path.unlink()
+
+            os.replace(tmp_path, path)
+
         else:
-            path.unlink()
+            os.replace(tmp_path, path)
 
-        os.replace(tmp_path, path)
+    except BaseException:
+        if not df_deleted:
+            try:
+                del df
+            except Exception:
+                pass
+            gc.collect()
 
-    else:
-        os.replace(tmp_path, path)
+        cleanup_tmp_file(tmp_path)
+        raise
 
     print(f"特征构建完成：{path}")
     print(f"行数：{row_count}")
@@ -863,7 +946,12 @@ def main():
     all_files = []
 
     for dir in PRODESSED_DIRS:
-        files = sorted(dir.glob("*.parquet"))
+        # 注意：不要把上次异常残留的 .tmp_feature.parquet / .tmp_fragment.parquet
+        # 当作正常输入文件再次处理。
+        files = [
+            p for p in sorted(dir.glob("*.parquet"))
+            if ".tmp" not in p.name and not p.name.endswith(".bak")
+        ]
         print(f"{dir} 找到 {len(files)} 个parquet文件")
         all_files.extend(files)
 
@@ -873,13 +961,36 @@ def main():
 
     for file in tqdm(all_files):
         try:
-            add_feature_1(file)
+            if RUN_EACH_FILE_IN_SUBPROCESS:
+                env = os.environ.copy()
+                env.setdefault("POLARS_MAX_THREADS", "1")
+                env.setdefault("OMP_NUM_THREADS", "1")
+                env.setdefault("MKL_NUM_THREADS", "1")
+                env.setdefault("OPENBLAS_NUM_THREADS", "1")
+                env.setdefault("PYTHONUNBUFFERED", "1")
+
+                result = subprocess.run(
+                    [sys.executable, str(Path(__file__).resolve()), "--one-file", str(file)],
+                    env=env,
+                )
+
+                if result.returncode != 0:
+                    failed.append(str(file))
+                    print()
+                    print(f"处理失败：{file}")
+                    print(f"子进程退出码：{result.returncode}")
+                    cleanup_tmp_file(file.with_name(file.name + TMP_SUFFIX))
+            else:
+                add_feature_1(file)
+
             gc.collect()
 
         except Exception as e:
             failed.append(str(file))
-            print(f"\n处理失败：{file}")
+            print()
+            print(f"处理失败：{file}")
             print(f"错误信息：{e}")
+            cleanup_tmp_file(file.with_name(file.name + TMP_SUFFIX))
             gc.collect()
 
     print("文件处理完成")
@@ -891,4 +1002,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 3 and sys.argv[1] == "--one-file":
+        add_feature_1(Path(sys.argv[2]))
+    else:
+        main()
