@@ -200,6 +200,7 @@ def parse_numeric_mass(text: str):
     从修饰字符串中提取数字质量。
     例如：
         57.02
+        42
         +15.9949
         -17.0265
         mass=57.02
@@ -225,29 +226,41 @@ def normalize_mod_name(name: str) -> str:
 
 
 # 常见数字修饰的精确质量修正。
-# 你的数据里出现 C[57.02]，它通常表示 Carbamidomethyl，
-# 精确质量应接近 57.021463735。
+# 例如：
+#   C[57.02] 通常表示 Carbamidomethyl，精确质量为 57.021463735
+#   n[42] 通常表示 N 端 Acetyl，精确质量为 42.010564684
 COMMON_NUMERIC_MODS = [
-    (57.02, 57.021463735, 0.03),       # Carbamidomethyl / CAM
-    (15.99, 15.99491461957, 0.03),     # Oxidation
-    (42.01, 42.010564684, 0.03),       # Acetyl
+    (57.02, 57.021463735, 0.05),       # Carbamidomethyl / CAM
+    (57.0, 57.021463735, 0.05),
+
+    (42.0, 42.010564684, 0.05),        # Acetyl
+    (42.01, 42.010564684, 0.05),
+
+    (15.99, 15.99491461957, 0.05),     # Oxidation
+    (16.0, 15.99491461957, 0.05),
+
     (79.97, 79.966330410, 0.05),       # Phospho
-    (0.98, 0.984015585, 0.02),         # Deamidated
-    (-17.03, -17.026549101, 0.03),     # Gln -> pyro-Glu
-    (-18.01, -18.010564684, 0.03),     # Glu -> pyro-Glu / H2O loss
+    (80.0, 79.966330410, 0.05),
+
+    (0.98, 0.984015585, 0.03),         # Deamidated
+
+    (-17.03, -17.026549101, 0.05),     # Gln -> pyro-Glu
+    (-18.01, -18.010564684, 0.05),     # Glu -> pyro-Glu / H2O loss
 ]
 
 
 def snap_numeric_mod_mass(x):
     """
-    将 57.02 这类截断质量修正到常见修饰的精确质量。
+    将 57.02、42 这类近似数字修饰修正到常见修饰的精确质量。
     如果不在常见范围内，则保留原数字。
     """
     if x is None:
         return None
 
+    x = float(x)
+
     for approx, exact, tol in COMMON_NUMERIC_MODS:
-        if abs(float(x) - approx) <= tol:
+        if abs(x - approx) <= tol:
             return exact
 
     return x
@@ -259,8 +272,10 @@ def get_mod_delta(mod_text: str):
     支持：
         Oxidation
         Carbamidomethyl
+        Acetyl
         UNIMOD:35
         57.02
+        42
         +15.9949
     """
     if mod_text is None:
@@ -307,7 +322,8 @@ def strip_flanking_aa(seq: str) -> str:
     middle = s[dot_positions[0] + 1:dot_positions[1]]
     right = s[dot_positions[1] + 1:]
 
-    # 只有类似 K.PEPTIDE.R 才剥掉两侧氨基酸
+    # 只有类似 K.PEPTIDE.R 才剥掉两侧氨基酸。
+    # 例如 K.n[42]PEPTIDE.R 会返回 n[42]PEPTIDE。
     if (
         len(left) == 1
         and len(right) == 1
@@ -324,11 +340,17 @@ def parse_peptide_features(seq):
     """
     解析 precursor_sequence，生成第一部分基础特征。
 
-    修复点：
-    1. 不再用 s.count(".") == 2 判断 flanking peptide。
-    2. C[57.02] 这类小数修饰不会再被错误截断。
-    3. N 端修饰会加到第一个残基质量上。
-    4. 如果出现独立括号修饰且前面已有残基，则计入 neutral_mass。
+    支持：
+        C[57.02]PEPTIDE
+        M[Oxidation]PEPTIDE
+        n[42]PEPTIDE
+        n[Acetyl]PEPTIDE
+        [Acetyl]-PEPTIDE
+        K.PEPTIDE.R
+        K.n[42]PEPTIDE.R
+
+    注意：
+        小写 n[42] 表示 N 端修饰，不是氨基酸 N。
     """
     if seq is None or str(seq).strip() == "":
         return {
@@ -358,11 +380,91 @@ def parse_peptide_features(seq):
     while i < len(s):
         ch = s[i]
 
-        # 情况 1：遇到独立修饰，如 [Acetyl]-PEPTIDE
+        # ----------------------------------------------------
+        # 情况 0：处理 n[42]PEPTIDE / n[Acetyl]PEPTIDE
+        # 小写 n 表示 N-terminal，不是氨基酸 N。
+        # 只在字符串开头把 n[...] 当作 N 端修饰。
+        # ----------------------------------------------------
+        if (
+            ch == "n"
+            and i == 0
+            and i + 1 < len(s)
+            and s[i + 1] in ["[", "(", "{"]
+        ):
+            open_ch = s[i + 1]
+            close_ch = {"[": "]", "(": ")", "{": "}"}[open_ch]
+            j = s.find(close_ch, i + 2)
+
+            if j == -1:
+                parse_ok = 0
+                i += 1
+                continue
+
+            mod_text = s[i + 2:j]
+            delta = get_mod_delta(mod_text)
+
+            mod_count += 1
+
+            if delta is None:
+                unknown_mod_count += 1
+                parse_ok = 0
+            else:
+                pending_nterm_delta += delta
+
+            i = j + 1
+            continue
+
+        # ----------------------------------------------------
+        # 情况 0.5：处理单独的小写 n 开头。
+        # 有些格式可能写成 nPEPTIDE，表示 N 端标记但无显式质量。
+        # 这种情况下跳过 n，不把它当作氨基酸 N。
+        # ----------------------------------------------------
+        if ch == "n" and i == 0:
+            i += 1
+            continue
+
+        # ----------------------------------------------------
+        # 情况 0.6：处理 C 端修饰，例如 PEPTIDEc[17]
+        # 只有 c[...] 在末尾时，才当作 C 端修饰。
+        # ----------------------------------------------------
+        if (
+            ch == "c"
+            and len(aa_list) > 0
+            and i + 1 < len(s)
+            and s[i + 1] in ["[", "(", "{"]
+        ):
+            open_ch = s[i + 1]
+            close_ch = {"[": "]", "(": ")", "{": "}"}[open_ch]
+            j = s.find(close_ch, i + 2)
+
+            if j == -1:
+                parse_ok = 0
+                i += 1
+                continue
+
+            rest = s[j + 1:].strip("-_. ")
+
+            if rest == "":
+                mod_text = s[i + 2:j]
+                delta = get_mod_delta(mod_text)
+
+                mod_count += 1
+
+                if delta is None:
+                    unknown_mod_count += 1
+                    parse_ok = 0
+                else:
+                    neutral_mass += delta
+
+                i = j + 1
+                continue
+
+        # ----------------------------------------------------
+        # 情况 1：遇到独立修饰，例如 [Acetyl]-PEPTIDE
+        # ----------------------------------------------------
         if ch in ["[", "(", "{"]:
             open_ch = ch
             close_ch = {"[": "]", "(": ")", "{": "}"}[open_ch]
-
             j = s.find(close_ch, i + 1)
 
             if j == -1:
@@ -379,25 +481,30 @@ def parse_peptide_features(seq):
                 unknown_mod_count += 1
                 parse_ok = 0
             else:
-                # 如果还没有残基，这是 N 端修饰，先暂存
+                # 如果还没有残基，这是 N 端修饰，先暂存。
+                # 如果已经有残基，对 neutral_mass 来说直接加总质量即可。
                 if len(aa_list) == 0:
                     pending_nterm_delta += delta
                 else:
-                    # 如果已经有残基，这是非标准位置的独立修饰，
-                    # 对第一部分 neutral_mass 来说，只要加入总质量即可。
                     neutral_mass += delta
 
             i = j + 1
             continue
 
+        # ----------------------------------------------------
         # 情况 2：正常氨基酸
-        if ch in AA_MASS:
-            aa = ch
+        # 常规数据是大写；如果有小写氨基酸，也转成大写处理。
+        # 但 n[42] 已经在前面被拦截，所以不会误当成 N。
+        # ----------------------------------------------------
+        aa_ch = ch.upper() if ch.isalpha() else ch
+
+        if aa_ch in AA_MASS:
+            aa = aa_ch
             aa_list.append(aa)
 
-            mass = AA_MASS[ch]
+            mass = AA_MASS[aa]
 
-            # N 端修饰加到第一个残基质量上
+            # N 端修饰加到第一个真实残基质量上
             if len(aa_list) == 1 and pending_nterm_delta != 0.0:
                 mass += pending_nterm_delta
                 pending_nterm_delta = 0.0
@@ -409,7 +516,6 @@ def parse_peptide_features(seq):
             while i < len(s) and s[i] in ["[", "(", "{"]:
                 open_ch = s[i]
                 close_ch = {"[": "]", "(": ")", "{": "}"}[open_ch]
-
                 j = s.find(close_ch, i + 1)
 
                 if j == -1:
@@ -432,12 +538,17 @@ def parse_peptide_features(seq):
 
             continue
 
+        # ----------------------------------------------------
         # 情况 3：分隔符，跳过
+        # ----------------------------------------------------
         if ch in ["-", "_", ".", " "]:
             i += 1
             continue
 
-        # 其他未知字符，不打印，避免几千万行数据时刷屏拖慢速度
+        # ----------------------------------------------------
+        # 情况 4：未知字符。
+        # 不打印，避免几千万行数据刷屏拖慢速度。
+        # ----------------------------------------------------
         parse_ok = 0
         i += 1
 
@@ -446,6 +557,13 @@ def parse_peptide_features(seq):
     if peptide_length == 0:
         parse_ok = 0
         neutral_mass = None
+
+    # 如果 pending_nterm_delta 还有残留，说明只有修饰但没有真实残基
+    if peptide_length > 0 and pending_nterm_delta != 0.0:
+        # 理论上不会走到这里，因为第一个残基会吃掉 pending。
+        # 保险起见，将它加到总质量。
+        neutral_mass += pending_nterm_delta
+        pending_nterm_delta = 0.0
 
     basic_aa_count = sum(1 for aa in aa_list if aa in ["K", "R", "H"])
     acidic_aa_count = sum(1 for aa in aa_list if aa in ["D", "E"])
@@ -1108,7 +1226,6 @@ def main():
         print("【以下文件处理失败】：")
         for f in failed:
             print(f)
-
 
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--one-file":

@@ -85,6 +85,33 @@ MOD_MASS = {
     "label:13c(6)15n(4)": 10.008269,
 }
 
+COMMON_NUMERIC_MODS = [
+    (42.0, 42.010564684, 0.05),        # Acetyl
+    (42.01, 42.010564684, 0.05),       # Acetyl
+    (57.02, 57.021463735, 0.05),       # Carbamidomethyl
+    (15.99, 15.99491461957, 0.05),     # Oxidation
+    (79.97, 79.966330410, 0.05),       # Phospho
+    (0.98, 0.984015585, 0.03),         # Deamidated
+    (-17.03, -17.026549101, 0.05),     # pyro-Glu
+    (-18.01, -18.010564684, 0.05),     # pyro-Glu / H2O loss
+]
+
+def snap_numeric_mod_mass(x):
+    """
+    把 [42]、[57.02] 这类近似数字修饰修正到常见精确质量。
+    如果不是常见修饰，就保留原始数字。
+    """
+    if x is None:
+        return None
+
+    x = float(x)
+
+    for approx, exact, tol in COMMON_NUMERIC_MODS:
+        if abs(x - approx) <= tol:
+            return exact
+
+    return x
+
 # ----------------------------------------
 # 新增的列名
 # ----------------------------------------
@@ -306,8 +333,13 @@ def get_mod_delta(mod):
         return MOD_MASS[key]
 
     # 如果修饰不在字典中，尝试从修饰名中提取质量
-    # 如 [+15.9949] [mass=57.02]
+    # 如 [57.02]
     numeric = parse_numeric_mass(mod)
+
+    # 获取常见修饰的精确质量
+    if numeric is not None:
+        return snap_numeric_mod_mass(numeric)
+
     return numeric
 
 def strip_flanking_aa(seq: str) -> str:
@@ -367,7 +399,70 @@ def parse_peptide_to_residue_masses(seq):
     while i < len(s):
         ch = s[i]
 
-        # 情况1：当前字符是修饰的左括号
+        # ----------------------------------------------------------
+        # 情况1: 处理 n[42]PEPTIDE
+        # 小写 n 表示 N-terminal，不是氨基酸 N。
+        if (ch == "n" and i == 0 and i + 1 < len(s) and s[i + 1] in ["{", "[", "("] ):
+            open_ch = s[i + 1]
+            close_ch = {"{": "}", "[": "]", "(": ")"}[open_ch]
+            j = s.find(close_ch, i + 2)
+
+            if j == -1:
+                parse_ok = 0
+                i += 1
+                continue
+
+            mod_text = s[i + 2:j]
+            delta = get_mod_delta(mod_text)
+
+            if delta is None:
+                parse_ok = 0
+            else:
+                pending_nterm_delta += delta
+
+            i = j + 1
+            continue
+
+        # 如果当前只有 n 没有修饰，则 n 只表示n端开头，跳过
+        if ch == "n" and i == 0:
+            i += 1
+            continue
+
+        # ----------------------------------------------------
+        # 情况2：处理 C-terminal 标记，例如 PEPTIDEc[17]
+        # 小写 c 只有在已经读到残基，并且 c[...] 后面没有其他真实字符时，才作为 C 端修饰处理。
+        if (
+            ch == "c"
+            and len(masses) > 0
+            and i + 1 < len(s)
+            and s[i + 1] in ["{", "[", "("]
+        ):
+            open_ch = s[i + 1]
+            close_ch = {"{": "}", "[": "]", "(": ")"}[open_ch]
+            j = s.find(close_ch, i + 2)
+
+            if j == -1:
+                parse_ok = 0
+                i += 1
+                continue
+
+            rest = s[j + 1:].strip("-_. ")
+
+            # 只有 c[...] 在末尾时才认为是 C 端修饰
+            if rest == "":
+                mod_text = s[i + 2:j]
+                delta = get_mod_delta(mod_text)
+
+                if delta is None:
+                    parse_ok = 0
+                else:
+                    masses[-1] += delta
+
+                i = j + 1
+                continue
+
+        # ----------------------------------------------------------
+        # 情况3：当前字符是修饰的左括号
         if ch in ["{", "[", "("]:
             open_ch = ch
 
@@ -398,7 +493,7 @@ def parse_peptide_to_residue_masses(seq):
             i = j + 1
             continue
 
-        # 情况2：当前字符为正常氨基酸
+        # 情况4：当前字符为正常氨基酸
         if ch in AA_MASS:
             aa = ch
             mass = AA_MASS[aa]
@@ -437,7 +532,7 @@ def parse_peptide_to_residue_masses(seq):
             masses.append(mass)
             continue
 
-        # 情况3：当前为分隔符，跳过
+        # 情况5：当前为分隔符，跳过
         if ch in ["-", "_", ".", " "]:
             i += 1
             continue
