@@ -1,12 +1,23 @@
 # 统计 b/y 离子的匹配特征
 from pathlib import Path
+import os
+
+# Keep native libraries conservative before importing polars/numpy.
+os.environ.setdefault("POLARS_MAX_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
+import sys
+import subprocess
+import gc
 from tqdm import tqdm
 import polars as pl
 import numpy as np
 import re
 from collections import OrderedDict
 import math
-import os
 
 PROCESSED_DIRS = [
     Path(r"E:\AIPC_dataset\processed\mzml_merged"),
@@ -16,6 +27,16 @@ PROCESSED_DIRS = [
 
 TMP_SUFFIX = ".tmp_fragment.parquet"
 MAKE_BACKUP = False
+
+# Process each parquet in a subprocess so the OS fully releases Polars/Arrow/Python heap memory.
+RUN_EACH_FILE_IN_SUBPROCESS = True
+
+# Batch size for Python feature lists. Lower value reduces peak RAM; higher value is faster.
+FEATURE_BATCH_SIZE = int(os.environ.get("FRAGMENT_FEATURE_BATCH_SIZE", "20000"))
+
+# Cache sizes affect only speed, not results. The old theoretical-ion cache was very large.
+SPEC_CACHE_SIZE = int(os.environ.get("FRAGMENT_SPEC_CACHE_SIZE", "512"))
+THEO_CACHE_SIZE = int(os.environ.get("FRAGMENT_THEO_CACHE_SIZE", "8192"))
 
 # ppm 容差
 PPM_TOLERANCES = [10.0, 20.0, 50.0]
@@ -904,6 +925,132 @@ def compute_fragment_features(seq, charge, spec, theo_cache):
 
 
 
+INT_FRAGMENT_FEATURE_COLS = [
+    "fragment_parse_ok",
+    "fragment_position_count",
+    "main_ion_count",
+    "b_ion_count",
+    "y_ion_count",
+    "loss_ion_count",
+    "matched_b_count_10ppm",
+    "matched_y_count_10ppm",
+    "matched_total_count_10ppm",
+    "matched_b_count_20ppm",
+    "matched_y_count_20ppm",
+    "matched_total_count_20ppm",
+    "matched_b_count_50ppm",
+    "matched_y_count_50ppm",
+    "matched_total_count_50ppm",
+    "matched_peak_count_20ppm",
+    "matched_top10_peak_count_20ppm",
+    "matched_top50_peak_count_20ppm",
+    "longest_b_ladder_20ppm",
+    "longest_y_ladder_20ppm",
+    "longest_combined_ladder_20ppm",
+    "b_y_complement_pair_count_20ppm",
+    "matched_loss_count_20ppm",
+]
+
+
+def empty_feature_data():
+    return {name: [] for name in FRAGMENT_FEATURE_NAMES}
+
+
+def empty_feature_df():
+    return pl.DataFrame({
+        name: pl.Series(
+            name,
+            [],
+            dtype=pl.Int32 if name in INT_FRAGMENT_FEATURE_COLS else pl.Float32,
+        )
+        for name in FRAGMENT_FEATURE_NAMES
+    })
+
+
+def cast_fragment_feature_df(feature_df: pl.DataFrame) -> pl.DataFrame:
+    if feature_df.height == 0:
+        return empty_feature_df()
+
+    feature_df = feature_df.with_columns([
+        pl.col(c).cast(pl.Int32) for c in INT_FRAGMENT_FEATURE_COLS if c in feature_df.columns
+    ])
+
+    float_cols = [c for c in feature_df.columns if c not in INT_FRAGMENT_FEATURE_COLS]
+    feature_df = feature_df.with_columns([
+        pl.col(c).cast(pl.Float32) for c in float_cols
+    ])
+
+    return feature_df.select(FRAGMENT_FEATURE_NAMES)
+
+
+def build_fragment_feature_df(work_df: pl.DataFrame, spec_cache: LRUCache, theo_cache: LRUCache) -> pl.DataFrame:
+    feature_batches = []
+    feature_data = empty_feature_data()
+    batch_len = 0
+
+    for row in tqdm(work_df.iter_rows(named=True), total=work_df.height):
+        group_key = row["group_key"]
+
+        spec = spec_cache.get(group_key)
+        if spec is None:
+            spec = preprocess_spectrum(row["mz_array"], row["intensity_array"])
+            spec_cache.put(group_key, spec)
+
+        feat = compute_fragment_features(
+            seq=row["precursor_sequence"],
+            charge=row["charge"],
+            spec=spec,
+            theo_cache=theo_cache,
+        )
+
+        for name in FRAGMENT_FEATURE_NAMES:
+            feature_data[name].append(feat[name])
+
+        batch_len += 1
+        if batch_len >= FEATURE_BATCH_SIZE:
+            feature_batches.append(cast_fragment_feature_df(pl.DataFrame(feature_data)))
+            feature_data = empty_feature_data()
+            batch_len = 0
+            gc.collect()
+
+    if batch_len > 0:
+        feature_batches.append(cast_fragment_feature_df(pl.DataFrame(feature_data)))
+
+    del feature_data
+    gc.collect()
+
+    if not feature_batches:
+        return empty_feature_df()
+
+    if len(feature_batches) == 1:
+        return feature_batches[0]
+
+    # Keep chunked columns to avoid an unnecessary full rechunk copy before the final parquet write.
+    return pl.concat(feature_batches, how="vertical", rechunk=False)
+
+
+def is_valid_parquet_file(path: Path) -> bool:
+    try:
+        if not path.exists() or path.stat().st_size < 8:
+            return False
+        with open(path, "rb") as f:
+            head = f.read(4)
+            f.seek(-4, os.SEEK_END)
+            tail = f.read(4)
+        return head == b"PAR1" and tail == b"PAR1"
+    except Exception:
+        return False
+
+
+def cleanup_tmp_file(tmp_path: Path):
+    try:
+        if tmp_path.exists():
+            tmp_path.unlink()
+            print(f"已删除临时文件：{tmp_path}")
+    except Exception as e:
+        print(f"临时文件删除失败：{tmp_path}，错误：{e}")
+
+
 def add_fragment_feature(path: Path):
     schema_cols = pl.scan_parquet(path).collect_schema().names()
     if "fragment_feature_done" in schema_cols:
@@ -916,134 +1063,103 @@ def add_fragment_feature(path: Path):
 
     print(f"\n开始处理：{path}")
 
-    df = pl.read_parquet(path)
-
-    # 如果中途失败，可能会已经存在 fragment 特征列，需要删除，防止重复列报错
-    existing_feature_cols = [c for c in FRAGMENT_FEATURE_NAMES + ["fragment_feature_done"] if c in df.columns]
-    if existing_feature_cols:
-        df = df.drop(existing_feature_cols)
-
     required_cols = [
         "precursor_sequence",
         "charge",
         "mz_array",
         "intensity_array",
-        "group_key"
+        "group_key",
     ]
 
-    missed_cols = [c for c in required_cols if c not in df.columns]
+    missed_cols = [c for c in required_cols if c not in schema_cols]
     if missed_cols:
         raise ValueError(f"缺少必要列：{missed_cols}")
 
-    # 记录下处理后的谱图 spec、理论 b/y 离子 theo
-    spec_cache = LRUCache(max_size=2048)
-    theo_cache = LRUCache(max_size=200000)
+    # Phase 1: read only columns needed for fragment matching and build features in small batches.
+    # This avoids keeping the full parquet plus large Python feature lists in memory at the same time.
+    work_df = pl.read_parquet(path, columns=required_cols)
+    row_count = work_df.height
 
-    # 存放新增特征的数据
-    feature_data = {name: [] for name in FRAGMENT_FEATURE_NAMES}
+    spec_cache = LRUCache(max_size=SPEC_CACHE_SIZE)
+    theo_cache = LRUCache(max_size=THEO_CACHE_SIZE)
 
-    iter_df = df.select([
-        "group_key",
-        "precursor_sequence",
-        "charge",
-        "mz_array",
-        "intensity_array",
-    ])
-    for row in tqdm(iter_df.iter_rows(named=True), total=df.height):
-        group_key = row["group_key"]
+    feature_df = build_fragment_feature_df(work_df, spec_cache, theo_cache)
 
-        # 当前 PSM 对应的谱图可能已被处理过，先查缓存
-        spec = spec_cache.get(group_key)
-        if spec is None:
-            # 获取处理后的谱图
-            spec = preprocess_spectrum(row["mz_array"], row["intensity_array"])
-            spec_cache.put(group_key, spec)
-
-        # 计算当前 PSM 所有片段特征
-        feat = compute_fragment_features(
-            seq = row["precursor_sequence"],
-            charge = row["charge"],
-            spec = spec,
-            theo_cache = theo_cache
+    if feature_df.height != row_count:
+        raise RuntimeError(
+            f"fragment feature 行数不一致：feature_df={feature_df.height}, 原始行数={row_count}"
         )
 
-        # 将当前行的特征写入 feature_data
-        for name in FRAGMENT_FEATURE_NAMES:
-            feature_data[name].append(feat[name])
+    del work_df
+    del spec_cache
+    del theo_cache
+    gc.collect()
 
-    feature_df = pl.DataFrame(feature_data)
-
-    # 将如下列转为 Int32，减小文件体积
-    int_cols = [
-        "fragment_parse_ok",
-        "fragment_position_count",
-        "main_ion_count",
-        "b_ion_count",
-        "y_ion_count",
-        "loss_ion_count",
-        "matched_b_count_10ppm",
-        "matched_y_count_10ppm",
-        "matched_total_count_10ppm",
-        "matched_b_count_20ppm",
-        "matched_y_count_20ppm",
-        "matched_total_count_20ppm",
-        "matched_b_count_50ppm",
-        "matched_y_count_50ppm",
-        "matched_total_count_50ppm",
-        "matched_peak_count_20ppm",
-        "matched_top10_peak_count_20ppm",
-        "matched_top50_peak_count_20ppm",
-        "longest_b_ladder_20ppm",
-        "longest_y_ladder_20ppm",
-        "longest_combined_ladder_20ppm",
-        "b_y_complement_pair_count_20ppm",
-        "matched_loss_count_20ppm",
+    # Phase 2: read the full parquet only when we are ready to append columns.
+    # Existing partial fragment columns are dropped before adding freshly computed columns.
+    df = pl.read_parquet(path)
+    existing_feature_cols = [
+        c for c in FRAGMENT_FEATURE_NAMES + ["fragment_feature_done"] if c in df.columns
     ]
+    if existing_feature_cols:
+        df = df.drop(existing_feature_cols)
 
-    feature_df = feature_df.with_columns([
-        pl.col(c).cast(pl.Int32) for c in int_cols if c in feature_df.columns
-    ])
-
-    # 其余列转为 float
-    float_cols = [c for c in feature_df.columns if c not in int_cols]
-    feature_df = feature_df.with_columns([
-        pl.col(c).cast(pl.Float32) for c in float_cols
-    ])
-
-    # hstack表示横向拼接，feature_df 中的新特征拼到 df 后面
     df = df.hstack(feature_df)
+    del feature_df
+    gc.collect()
 
-    # 添加标记列
     df = df.with_columns([
         pl.lit(1).cast(pl.Int8).alias("fragment_feature_done")
     ])
 
-    # 写入临时文件
     tmp_path = path.with_name(path.name + TMP_SUFFIX)
-    df.write_parquet(tmp_path)
+    cleanup_tmp_file(tmp_path)
 
-    if MAKE_BACKUP:
-        backup_path = path.with_name(path.name + ".bak_fragment")
+    df_deleted = False
+    try:
+        df.write_parquet(tmp_path)
 
-        # 如果备份还不存在，就把原文件移动成备份
-        if not backup_path.exists():
-            os.replace(path, backup_path)
-        # 如果备份已经存在，就删除原文件
+        if not is_valid_parquet_file(tmp_path):
+            raise RuntimeError(f"临时 parquet 写入不完整：{tmp_path}")
+
+        del df
+        df_deleted = True
+        gc.collect()
+
+        if MAKE_BACKUP:
+            backup_path = path.with_name(path.name + ".bak_fragment")
+
+            if not backup_path.exists():
+                os.replace(path, backup_path)
+            else:
+                path.unlink()
+
+            os.replace(tmp_path, path)
         else:
-            path.unlink()
+            os.replace(tmp_path, path)
 
-        # 用临时文件替换原文件路径
-        os.replace(tmp_path, path)
+    except BaseException:
+        if not df_deleted:
+            try:
+                del df
+            except Exception:
+                pass
+            gc.collect()
+        cleanup_tmp_file(tmp_path)
+        raise
 
-    else:
-        os.replace(tmp_path, path)
     print(f"b/y 特征添加完成：{path}")
-    print(f"行数：{df.height}")
+    print(f"行数：{row_count}")
 
 def main():
     all_files = []
     for dir in PROCESSED_DIRS:
-        files = sorted(dir.rglob(f"*.parquet"))
+        files = [
+            p for p in sorted(dir.rglob("*.parquet"))
+            if ".tmp" not in p.name
+            and not p.name.endswith(".bak")
+            and not p.name.endswith(".bak_fragment")
+        ]
         print(f"{dir} 找到 {len(files)} 个 parquet")
         all_files.extend(files)
 
@@ -1052,20 +1168,35 @@ def main():
 
     for path in tqdm(all_files):
         try:
-            add_fragment_feature(path)
+            if RUN_EACH_FILE_IN_SUBPROCESS:
+                env = os.environ.copy()
+                env.setdefault("POLARS_MAX_THREADS", "1")
+                env.setdefault("OMP_NUM_THREADS", "1")
+                env.setdefault("MKL_NUM_THREADS", "1")
+                env.setdefault("OPENBLAS_NUM_THREADS", "1")
+                env.setdefault("PYTHONUNBUFFERED", "1")
+
+                result = subprocess.run(
+                    [sys.executable, str(Path(__file__).resolve()), "--one-file", str(path)],
+                    env=env,
+                )
+
+                if result.returncode != 0:
+                    failed.append(str(path))
+                    print(f"处理失败：{path}")
+                    print(f"子进程退出码：{result.returncode}")
+                    cleanup_tmp_file(path.with_name(path.name + TMP_SUFFIX))
+            else:
+                add_fragment_feature(path)
+
+            gc.collect()
 
         except Exception as e:
-            # 单个文件失败时不直接崩溃
             failed.append(str(path))
-
             print(f"处理失败：{path}")
             print(f"错误信息：{e}")
-
-            # 如果失败时产生了临时文件则删除
-            tmp_path = path.with_name(path.name + TMP_SUFFIX)
-
-            if tmp_path.exists():
-                tmp_path.unlink()
+            cleanup_tmp_file(path.with_name(path.name + TMP_SUFFIX))
+            gc.collect()
 
     print("处理完成")
 
@@ -1077,4 +1208,7 @@ def main():
         print("无失败文件")
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 3 and sys.argv[1] == "--one-file":
+        add_fragment_feature(Path(sys.argv[2]))
+    else:
+        main()
