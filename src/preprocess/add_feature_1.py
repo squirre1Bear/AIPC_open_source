@@ -32,10 +32,13 @@ TMP_SUFFIX = ".tmp_feature.parquet"
 # 每张谱图保留 TOPK_PEAKS 个峰
 TOPK_PEAKS = 500
 
-# 稳定模式：每个 parquet 文件放到独立子进程处理。
+# 每个 parquet 文件放到独立子进程处理。
 # 这样即使 Polars / Arrow 底层因为内存压力崩溃，也不会拖死整个任务，
 # 并且每个文件处理完后操作系统会彻底回收内存。
 RUN_EACH_FILE_IN_SUBPROCESS = True
+
+# 修复了肽段解析逻辑，需要设为 True，强制重新计算并覆盖。
+FORCE_REBUILD_AUX_FEATURES = True
 
 # 只读取本脚本需要的列，避免把 parquet 里的无关列全部读进内存
 NEEDED_COLS = [
@@ -193,6 +196,14 @@ def trim_spectrum_struct(s):
 
 
 def parse_numeric_mass(text: str):
+    """
+    从修饰字符串中提取数字质量。
+    例如：
+        57.02
+        +15.9949
+        -17.0265
+        mass=57.02
+    """
     text = str(text).strip()
     m = re.search(r"[-+]?\d+(?:\.\d+)?", text)
 
@@ -203,13 +214,55 @@ def parse_numeric_mass(text: str):
 
 
 def normalize_mod_name(name: str) -> str:
+    """
+    标准化修饰名称。
+    """
     name = str(name).strip()
+    name = name.lower()
     name = name.replace("_", "")
     name = name.replace(" ", "")
-    return name.lower()
+    return name
+
+
+# 常见数字修饰的精确质量修正。
+# 你的数据里出现 C[57.02]，它通常表示 Carbamidomethyl，
+# 精确质量应接近 57.021463735。
+COMMON_NUMERIC_MODS = [
+    (57.02, 57.021463735, 0.03),       # Carbamidomethyl / CAM
+    (15.99, 15.99491461957, 0.03),     # Oxidation
+    (42.01, 42.010564684, 0.03),       # Acetyl
+    (79.97, 79.966330410, 0.05),       # Phospho
+    (0.98, 0.984015585, 0.02),         # Deamidated
+    (-17.03, -17.026549101, 0.03),     # Gln -> pyro-Glu
+    (-18.01, -18.010564684, 0.03),     # Glu -> pyro-Glu / H2O loss
+]
+
+
+def snap_numeric_mod_mass(x):
+    """
+    将 57.02 这类截断质量修正到常见修饰的精确质量。
+    如果不在常见范围内，则保留原数字。
+    """
+    if x is None:
+        return None
+
+    for approx, exact, tol in COMMON_NUMERIC_MODS:
+        if abs(float(x) - approx) <= tol:
+            return exact
+
+    return x
 
 
 def get_mod_delta(mod_text: str):
+    """
+    根据修饰文本获取质量偏移。
+    支持：
+        Oxidation
+        Carbamidomethyl
+        UNIMOD:35
+        57.02
+        +15.9949
+    """
     if mod_text is None:
         return None
 
@@ -221,12 +274,62 @@ def get_mod_delta(mod_text: str):
     numeric = parse_numeric_mass(mod_text)
 
     if numeric is not None:
-        return numeric
+        return snap_numeric_mod_mass(numeric)
 
     return None
 
 
+def strip_flanking_aa(seq: str) -> str:
+    """
+    只处理真正的 K.PEPTIDE.R 格式。
+
+    关键点：
+    [57.02] 里的小数点不能当作分隔符。
+    所以这里只统计括号外的点。
+    """
+    s = str(seq).strip()
+
+    dot_positions = []
+    depth = 0
+
+    for i, ch in enumerate(s):
+        if ch in ["[", "(", "{"]:
+            depth += 1
+        elif ch in ["]", ")", "}"]:
+            depth = max(0, depth - 1)
+        elif ch == "." and depth == 0:
+            dot_positions.append(i)
+
+    if len(dot_positions) != 2:
+        return s
+
+    left = s[:dot_positions[0]]
+    middle = s[dot_positions[0] + 1:dot_positions[1]]
+    right = s[dot_positions[1] + 1:]
+
+    # 只有类似 K.PEPTIDE.R 才剥掉两侧氨基酸
+    if (
+        len(left) == 1
+        and len(right) == 1
+        and left in AA_MASS
+        and right in AA_MASS
+        and len(middle) > 0
+    ):
+        return middle
+
+    return s
+
+
 def parse_peptide_features(seq):
+    """
+    解析 precursor_sequence，生成第一部分基础特征。
+
+    修复点：
+    1. 不再用 s.count(".") == 2 判断 flanking peptide。
+    2. C[57.02] 这类小数修饰不会再被错误截断。
+    3. N 端修饰会加到第一个残基质量上。
+    4. 如果出现独立括号修饰且前面已有残基，则计入 neutral_mass。
+    """
     if seq is None or str(seq).strip() == "":
         return {
             "peptide_length": 0,
@@ -241,11 +344,7 @@ def parse_peptide_features(seq):
             "parse_ok": 0,
         }
 
-    s = str(seq).strip()
-
-    if s.count(".") == 2:
-        parts = s.split(".")
-        s = parts[1]
+    s = strip_flanking_aa(seq)
 
     aa_list = []
     mod_count = 0
@@ -259,6 +358,7 @@ def parse_peptide_features(seq):
     while i < len(s):
         ch = s[i]
 
+        # 情况 1：遇到独立修饰，如 [Acetyl]-PEPTIDE
         if ch in ["[", "(", "{"]:
             open_ch = ch
             close_ch = {"[": "]", "(": ")", "{": "}"}[open_ch]
@@ -279,16 +379,25 @@ def parse_peptide_features(seq):
                 unknown_mod_count += 1
                 parse_ok = 0
             else:
-                pending_nterm_delta += delta
+                # 如果还没有残基，这是 N 端修饰，先暂存
+                if len(aa_list) == 0:
+                    pending_nterm_delta += delta
+                else:
+                    # 如果已经有残基，这是非标准位置的独立修饰，
+                    # 对第一部分 neutral_mass 来说，只要加入总质量即可。
+                    neutral_mass += delta
 
             i = j + 1
             continue
 
+        # 情况 2：正常氨基酸
         if ch in AA_MASS:
-            aa_list.append(ch)
+            aa = ch
+            aa_list.append(aa)
 
             mass = AA_MASS[ch]
 
+            # N 端修饰加到第一个残基质量上
             if len(aa_list) == 1 and pending_nterm_delta != 0.0:
                 mass += pending_nterm_delta
                 pending_nterm_delta = 0.0
@@ -296,6 +405,7 @@ def parse_peptide_features(seq):
             neutral_mass += mass
             i += 1
 
+            # 处理残基后的修饰，例如 C[57.02]、M[Oxidation]
             while i < len(s) and s[i] in ["[", "(", "{"]:
                 open_ch = s[i]
                 close_ch = {"[": "]", "(": ")", "{": "}"}[open_ch]
@@ -304,6 +414,7 @@ def parse_peptide_features(seq):
 
                 if j == -1:
                     parse_ok = 0
+                    i += 1
                     break
 
                 mod_text = s[i + 1:j]
@@ -321,10 +432,13 @@ def parse_peptide_features(seq):
 
             continue
 
+        # 情况 3：分隔符，跳过
         if ch in ["-", "_", ".", " "]:
             i += 1
             continue
 
+        # 其他未知字符，不打印，避免几千万行数据时刷屏拖慢速度
+        parse_ok = 0
         i += 1
 
     peptide_length = len(aa_list)
@@ -347,11 +461,6 @@ def parse_peptide_features(seq):
         if aa_list[idx] in ["K", "R"] and aa_list[idx + 1] != "P":
             missed_cleavage_like += 1
 
-    # 注意：
-    # 这里返回的是 Python int / Python float。
-    # Polars 会把 Python int 推断为 Int64，把 Python float 推断为 Float64。
-    # 所以后面 map_elements 的 return_dtype 必须先写 Int64 / Float64，
-    # 再在展开 struct 后 cast 成 Int32 / Int8 / Float32。
     return {
         "peptide_length": peptide_length,
         "mod_count": mod_count,
@@ -469,7 +578,7 @@ def add_feature_1(path: Path):
     # 先只读 schema，避免为了检查 aux_feature_done 就把整个 parquet 读进内存
     schema_cols = pl.scan_parquet(path).collect_schema().names()
 
-    if "aux_feature_done" in schema_cols:
+    if "aux_feature_done" in schema_cols and not FORCE_REBUILD_AUX_FEATURES:
         print(f"已处理过，跳过：{path}")
         return
 
