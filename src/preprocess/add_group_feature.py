@@ -1,6 +1,6 @@
-# AIPC_GROUP_WORKERS=20 python src/preprocess/add_group_feature.py \
+# AIPC_GROUP_WORKERS=25 python src/preprocess/add_group_feature.py \
 #   --data-root /root/autodl-tmp/datasets/aipc \
-#   --model-dir /root/autodl-tmp/datasets/aipc/models/lgbm_table_v1 \
+#   --model-dir /root/aipc/models/lgbm_v1 \
 #   --splits train valid
 
 from pathlib import Path
