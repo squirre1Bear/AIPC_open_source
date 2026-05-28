@@ -1,8 +1,10 @@
 # 统计 b/y 离子的匹配特征
+# AIPC_WORKERS=20 python src/preprocess/add_feature_2.py
 from pathlib import Path
 import os
 
 # Keep native libraries conservative before importing polars/numpy.
+# 这里故意保持每个子进程内部单线程；通过同时跑多个 parquet 文件来吃满多核 CPU。
 os.environ.setdefault("POLARS_MAX_THREADS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -12,6 +14,7 @@ os.environ.setdefault("PYTHONUNBUFFERED", "1")
 import sys
 import subprocess
 import gc
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import polars as pl
 import numpy as np
@@ -19,11 +22,19 @@ import re
 from collections import OrderedDict
 import math
 
+# 服务器数据集在 /root/autodl-tmp/datasets/aipc/
+
 PROCESSED_DIRS = [
-    Path(r"E:\AIPC_dataset\processed\mzml_merged"),
-    Path(r"E:\AIPC_dataset\processed\tims_merged"),
-    Path(r"E:\AIPC_dataset\processed\wiff_merged"),
+    Path(r"/root/autodl-tmp/datasets/aipc/processed/mzml_merged"),
+    Path(r"/root/autodl-tmp/datasets/aipc/processed/tims_merged"),
+    Path(r"/root/autodl-tmp/datasets/aipc/processed/wiff_merged")
 ]
+
+# # 上传 mzml 的时候可以本地先跑着 wiff
+# # 后面上传上去也可以跳过处理过了的文件
+# PROCESSED_DIRS = [
+#     Path(r"E:\AIPC_dataset\processed\wiff_merged")
+# ]
 
 TMP_SUFFIX = ".tmp_fragment.parquet"
 MAKE_BACKUP = False
@@ -31,12 +42,16 @@ MAKE_BACKUP = False
 # Process each parquet in a subprocess so the OS fully releases Polars/Arrow/Python heap memory.
 RUN_EACH_FILE_IN_SUBPROCESS = True
 
+# 同时处理多少个 parquet 文件。
+# 运行时可以这样覆盖：AIPC_WORKERS=20 python src/preprocess/add_feature_2.py
+MAX_PARALLEL_FILES = int(os.environ.get("AIPC_WORKERS", "20"))
+
 # Batch size for Python feature lists. Lower value reduces peak RAM; higher value is faster.
-FEATURE_BATCH_SIZE = int(os.environ.get("FRAGMENT_FEATURE_BATCH_SIZE", "20000"))
+FEATURE_BATCH_SIZE = 80000
 
 # Cache sizes affect only speed, not results. The old theoretical-ion cache was very large.
-SPEC_CACHE_SIZE = int(os.environ.get("FRAGMENT_SPEC_CACHE_SIZE", "512"))
-THEO_CACHE_SIZE = int(os.environ.get("FRAGMENT_THEO_CACHE_SIZE", "8192"))
+SPEC_CACHE_SIZE = 2048
+THEO_CACHE_SIZE = 32768
 
 # ppm 容差
 PPM_TOLERANCES = [10.0, 20.0, 50.0]
@@ -71,6 +86,7 @@ AA_MASS = {
     "W": 186.079312980,
     "Y": 163.063328575,
     "V": 99.068413945,
+    "U": 150.953633405,
 }
 
 MOD_MASS = {
@@ -117,6 +133,7 @@ COMMON_NUMERIC_MODS = [
     (-18.01, -18.010564684, 0.05),     # pyro-Glu / H2O loss
 ]
 
+
 def snap_numeric_mod_mass(x):
     """
     把 [42]、[57.02] 这类近似数字修饰修正到常见精确质量。
@@ -133,11 +150,12 @@ def snap_numeric_mod_mass(x):
 
     return x
 
+
 # ----------------------------------------
 # 新增的列名
 # ----------------------------------------
 FRAGMENT_FEATURE_NAMES = [
-# 解析状态
+    # 解析状态
     "fragment_parse_ok",
     "fragment_position_count",
     "main_ion_count",
@@ -147,10 +165,10 @@ FRAGMENT_FEATURE_NAMES = [
 
     # 10 ppm 命中特征
     "matched_b_count_10ppm",
-    "matched_y_count_10ppm",    # 10 ppm 下命中的b y离子个数
+    "matched_y_count_10ppm",    # 10 ppm 下命中的 b y 离子个数
     "matched_total_count_10ppm",
     "matched_b_fraction_10ppm",
-    "matched_y_fraction_10ppm",   # 命中的b y离子比例
+    "matched_y_fraction_10ppm",   # 命中的 b y 离子比例
     "matched_total_fraction_10ppm",
 
     # 20 ppm 命中特征
@@ -170,20 +188,20 @@ FRAGMENT_FEATURE_NAMES = [
     "matched_total_fraction_50ppm",
 
     # 解释峰强
-    "matched_peak_count_20ppm",  # 20 ppm 下谱图中能被b y离子解释的谱峰数
+    "matched_peak_count_20ppm",  # 20 ppm 下谱图中能被 b y 离子解释的谱峰数
     "explained_intensity_fraction_20ppm",
     "top50_explained_intensity_fraction_20ppm",
 
     # ppm 误差统计
     "mean_abs_fragment_ppm_20ppm",
     "median_abs_fragment_ppm_20ppm",
-    "std_abs_fragment_ppm_20ppm",  # 20 ppm 下匹配成功的ppm最小值、中位数、标准差
+    "std_abs_fragment_ppm_20ppm",  # 20 ppm 下匹配成功的 ppm 最小值、中位数、标准差
     "mean_signed_fragment_ppm_20ppm",
     "intensity_weighted_abs_fragment_ppm_20ppm",  # 按峰强度加权后的绝对 ppm 平均误差
 
     # 匹配峰排名
     "matched_peak_rank_mean_20ppm",
-    "matched_peak_rank_min_20ppm",   # 按峰强度排名，1为最强峰
+    "matched_peak_rank_min_20ppm",   # 按峰强度排名，1 为最强峰
     "matched_top10_peak_count_20ppm",
     "matched_top50_peak_count_20ppm",
 
@@ -191,15 +209,16 @@ FRAGMENT_FEATURE_NAMES = [
     "longest_b_ladder_20ppm",
     "longest_y_ladder_20ppm",
     "longest_combined_ladder_20ppm",    # 以上两值中的最大值
-    "b_y_complement_pair_count_20ppm",   # 同一个肽段切分点位上，b y离子均在 20ppm 下均命中的数量
+    "b_y_complement_pair_count_20ppm",   # 同一个肽段切分点位上，b y 离子均在 20ppm 下均命中的数量
     "n_terminal_coverage_20ppm",
-    "c_terminal_coverage_20ppm",   # +1 电荷的b y离子匹配结果
+    "c_terminal_coverage_20ppm",   # +1 电荷的 b y 离子匹配结果
 
     # neutral loss 特征
     "matched_loss_count_20ppm",
     "matched_loss_fraction_20ppm",
     "loss_explained_intensity_fraction_20ppm",
 ]
+
 
 def safe_float(x, default=0.0):
     try:
@@ -214,13 +233,15 @@ def safe_float(x, default=0.0):
     except Exception:
         return default
 
+
 def safe_div(a, b, default=0.0):
     if b == 0 or b is None:
         return default
 
     return float(a) / float(b)
 
-# 计算 flags 中，最长连续 Ture 的长度
+
+# 计算 flags 中，最长连续 True 的长度
 def longest_true_run(flags):
     longest = 0
     cur = 0
@@ -234,6 +255,7 @@ def longest_true_run(flags):
 
     return longest
 
+
 # LRU 缓存，避免重复解析肽段或谱图
 class LRUCache:
     def __init__(self, max_size=4096):
@@ -241,7 +263,7 @@ class LRUCache:
         self.data = OrderedDict()
 
     def get(self, key):
-        # 缓存没有则返回None
+        # 缓存没有则返回 None
         if key not in self.data:
             return None
         value = self.data.pop(key)
@@ -250,13 +272,13 @@ class LRUCache:
 
     def put(self, key, value):
         if key in self.data:
-            self.data.pop(key)  # 先删掉旧的，在新插入末尾
+            self.data.pop(key)  # 先删掉旧的，再新插入末尾
         elif len(self.data) >= self.max_size:
-            self.data.popitem(last=False)  # last=False表示先删除最前面的，也就是最久没有使用的
+            self.data.popitem(last=False)  # last=False 表示先删除最前面的，也就是最久没有使用的
         self.data[key] = value
 
-def preprocess_spectrum(mz_array, intensity_array):
 
+def preprocess_spectrum(mz_array, intensity_array):
     # 谱图为空，或是强度、质荷比无法一一对应
     if mz_array is None or intensity_array is None:
         return {
@@ -280,8 +302,7 @@ def preprocess_spectrum(mz_array, intensity_array):
             "top50_total_intensity": 0.0,
         }
 
-
-    # 过滤谱图中的非法值和0
+    # 过滤谱图中的非法值和 0
     mask = (
         np.isfinite(mz)
         & np.isfinite(intensity)
@@ -307,7 +328,7 @@ def preprocess_spectrum(mz_array, intensity_array):
     mz = mz[order_mz]
     intensity = intensity[order_mz]
 
-    # 峰强度 从大到小 排序
+    # 峰强度从大到小排序
     order_intensity = np.argsort(-intensity)
     rank = np.empty(len(intensity), dtype=np.int32)
     rank[order_intensity] = np.arange(1, len(order_intensity) + 1, dtype=np.int32)
@@ -321,8 +342,9 @@ def preprocess_spectrum(mz_array, intensity_array):
         "intensity": intensity,
         "rank": rank,
         "total_intensity": total_intensity,
-        "top50_total_intensity": top50_total_intensity
+        "top50_total_intensity": top50_total_intensity,
     }
+
 
 # 标准化修饰的名称
 def normalize_mod_name(name):
@@ -331,6 +353,7 @@ def normalize_mod_name(name):
     name = name.replace("_", "")
     name = name.replace(" ", "")
     return name
+
 
 # 根据修饰名中的数字提取质量
 def parse_numeric_mass(text):
@@ -341,6 +364,7 @@ def parse_numeric_mass(text):
     if m is None:
         return None
     return safe_float(m.group(0), default=None)
+
 
 # 根据修饰文本获取质量偏移
 def get_mod_delta(mod):
@@ -363,11 +387,11 @@ def get_mod_delta(mod):
 
     return numeric
 
+
 def strip_flanking_aa(seq: str) -> str:
     """
     只处理真正的 K.PEPTIDE.R 格式。
-    注意：
-    [57.02] 里的小数点不能当作分隔符。
+    注意：[57.02] 里的小数点不能当作分隔符。
     """
     s = str(seq).strip()
 
@@ -401,13 +425,14 @@ def strip_flanking_aa(seq: str) -> str:
 
     return s
 
+
 # 肽段解析，返回氨基酸序列 + 每个残基质量
 def parse_peptide_to_residue_masses(seq):
     if seq is None or str(seq).strip() == "":
         return [], [], 0
 
     # 处理 K.PEPTIDE.R 的情况
-    # 之前直接找两个 . 的代码会把IGTHNGTFHC[57.02]DEALAC[57.02]ALLR识别错误
+    # 之前直接找两个 . 的代码会把 IGTHNGTFHC[57.02]DEALAC[57.02]ALLR 识别错误
     s = strip_flanking_aa(seq)
 
     aa_list = []
@@ -423,7 +448,7 @@ def parse_peptide_to_residue_masses(seq):
         # ----------------------------------------------------------
         # 情况1: 处理 n[42]PEPTIDE
         # 小写 n 表示 N-terminal，不是氨基酸 N。
-        if (ch == "n" and i == 0 and i + 1 < len(s) and s[i + 1] in ["{", "[", "("] ):
+        if ch == "n" and i == 0 and i + 1 < len(s) and s[i + 1] in ["{", "[", "("]:
             open_ch = s[i + 1]
             close_ch = {"{": "}", "[": "]", "(": ")"}[open_ch]
             j = s.find(close_ch, i + 2)
@@ -444,7 +469,7 @@ def parse_peptide_to_residue_masses(seq):
             i = j + 1
             continue
 
-        # 如果当前只有 n 没有修饰，则 n 只表示n端开头，跳过
+        # 如果当前只有 n 没有修饰，则 n 只表示 n 端开头，跳过
         if ch == "n" and i == 0:
             i += 1
             continue
@@ -489,7 +514,7 @@ def parse_peptide_to_residue_masses(seq):
 
             # 找到对应的右括号
             close_ch = {"{": "}", "[": "]", "(": ")"}[open_ch]
-            j = s.find(close_ch, i+1)
+            j = s.find(close_ch, i + 1)
 
             # 没找到右括号，格式有误。跳过该字符
             if j == -1:
@@ -498,7 +523,7 @@ def parse_peptide_to_residue_masses(seq):
                 continue
 
             # 取出括号内的修饰
-            mod_text = s[i+1: j]
+            mod_text = s[i + 1:j]
             # 获取修饰质量偏移
             delta = get_mod_delta(mod_text)
 
@@ -507,7 +532,7 @@ def parse_peptide_to_residue_masses(seq):
                 parse_ok = 0
             else:
                 if len(masses) == 0:
-                    # 当前还没有残基质量，则当前为N端修饰
+                    # 当前还没有残基质量，则当前为 N 端修饰
                     pending_nterm_delta += delta
                 else:
                     masses[-1] += delta
@@ -519,7 +544,7 @@ def parse_peptide_to_residue_masses(seq):
             aa = ch
             mass = AA_MASS[aa]
 
-            # n端有修饰的情况下，将该修饰质量加到第一个残基上
+            # n 端有修饰的情况下，将该修饰质量加到第一个残基上
             if len(aa_list) == 0 and pending_nterm_delta != 0:
                 mass += pending_nterm_delta
                 pending_nterm_delta = 0.0
@@ -532,14 +557,14 @@ def parse_peptide_to_residue_masses(seq):
             while i < len(s) and s[i] in ["{", "[", "("]:
                 open_ch = s[i]
                 close_ch = {"{": "}", "[": "]", "(": ")"}[open_ch]
-                j = s.find(close_ch, i+1)
+                j = s.find(close_ch, i + 1)
 
                 if j == -1:
                     parse_ok = 0
                     i += 1
                     break
 
-                mod_text = s[i+1: j]
+                mod_text = s[i + 1:j]
                 delta = get_mod_delta(mod_text)
 
                 if delta is None:
@@ -568,20 +593,21 @@ def parse_peptide_to_residue_masses(seq):
 
     return aa_list, masses, parse_ok
 
+
 # 生成理论 b/y 离子
 def build_theoretical_b_y_ions(seq, precursor_chage):
-    # 从肽段解析出 氨基酸序列、残基（含修饰）的质量
+    # 从肽段解析出氨基酸序列、残基（含修饰）的质量
     aa_list, residue_masses, parse_ok = parse_peptide_to_residue_masses(seq)
 
     # 记录残基数量
     n = len(residue_masses)
 
     if n < 2:
-        return{
-            "parse_ok": 0,        # 肽段无法解析 / 长度小于2个氨基酸
+        return {
+            "parse_ok": 0,        # 肽段无法解析 / 长度小于 2 个氨基酸
             "position_count": 0,  # 可切割点位数量
             "main_ions": [],      # b/y 离子切割结果
-            "loss_ions": []       # 计算丢失中性粒子（H20、NH3）后的理论碎片
+            "loss_ions": [],      # 计算丢失中性粒子（H20、NH3）后的理论碎片
         }
 
     try:
@@ -606,12 +632,12 @@ def build_theoretical_b_y_ions(seq, precursor_chage):
 
     # b/y 离子
     main_ions = []
-    # 丢失H2O/NH3的离子
+    # 丢失 H2O/NH3 的离子
     loss_ions = []
 
     # 遍历 n-1 个可切割点
     for cleavage_idx in range(1, n):
-        # 默认 b 离子不加质量， y 离子加 H2O 质量
+        # 默认 b 离子不加质量，y 离子加 H2O 质量
         b_neutral = float(prefix[cleavage_idx - 1])
         y_neutral = total_residue_mass - b_neutral + H2O
         position = cleavage_idx
@@ -625,18 +651,18 @@ def build_theoretical_b_y_ions(seq, precursor_chage):
                 "series": "b",         # 离子系列
                 "position": position,  # 切割位置（1~n-1）
                 "charge": z,
-                "mz": b_mz
+                "mz": b_mz,
             })
 
             main_ions.append({
                 "series": "y",
                 "position": position,
                 "charge": z,
-                "mz": y_mz
+                "mz": y_mz,
             })
 
         # 处理中性粒子丢失的质量
-        # neutral loss只计算 +1 电荷，防止引入过多噪声
+        # neutral loss 只计算 +1 电荷，防止引入过多噪声
         b1_mz = b_neutral + PROTON
         y1_mz = y_neutral + PROTON
 
@@ -662,22 +688,23 @@ def build_theoretical_b_y_ions(seq, precursor_chage):
 
     return {
         "parse_ok": parse_ok,
-        "position_count": n-1,
+        "position_count": n - 1,
         "main_ions": main_ions,
-        "loss_ions": loss_ions
+        "loss_ions": loss_ions,
     }
+
 
 # 匹配理论离子和最近峰
 def nearest_peak_match(spec, theo_mz):
     """
     输入：
-        spec:谱图字典
-        theo_mz:某个理论离子的 m/z
+        spec: 谱图字典
+        theo_mz: 某个理论离子的 m/z
     返回：
-        best_idx:最接近实测峰在数组中的位置
-        signed_ppm:带正负号的 ppm 误差
-        abs_ppm:ppm 误差绝对值
-        intensity:最接近实测峰的强度
+        best_idx: 最接近实测峰在数组中的位置
+        signed_ppm: 带正负号的 ppm 误差
+        abs_ppm: ppm 误差绝对值
+        intensity: 最接近实测峰的强度
         rank: 最接近实测峰的强度排名
     """
     mz = spec["mz"]
@@ -685,7 +712,7 @@ def nearest_peak_match(spec, theo_mz):
         return -1, 999999.0, 999999.0, 0.0, 999999
 
     # np.searchsorted 寻找在有序数组中的插入位置
-    # 最近峰只会在插入位置 左1/右1 的峰里
+    # 最近峰只会在插入位置左 1 / 右 1 的峰里
     pos = np.searchsorted(mz, theo_mz)
 
     candidates = []
@@ -701,7 +728,7 @@ def nearest_peak_match(spec, theo_mz):
 
     best_idx = min(candidates, key=lambda idx: abs(mz[idx] - theo_mz))
 
-    # ppm = （实测mz - 理论mz）/ 理论mz * 100w
+    # ppm = （实测 mz - 理论 mz）/ 理论 mz * 100w
     signed_ppm = (mz[best_idx] - theo_mz) / theo_mz * 1_000_000.0
     abs_ppm = abs(signed_ppm)
 
@@ -710,12 +737,12 @@ def nearest_peak_match(spec, theo_mz):
         float(signed_ppm),
         float(abs_ppm),
         float(spec["intensity"][best_idx]),
-        float(spec["rank"][best_idx])
+        float(spec["rank"][best_idx]),
     )
+
 
 # 计算 PSM 的片段特征
 def compute_fragment_features(seq, charge, spec, theo_cache):
-
     key = (str(seq), int(charge) if charge is not None else 1)
 
     # 尝试从缓存取出理论离子
@@ -730,8 +757,8 @@ def compute_fragment_features(seq, charge, spec, theo_cache):
     main_ion_count = len(main_ions)
     loss_ion_count = len(loss_ions)
 
-    b_ion_count = sum(1 for ion in main_ions if ion["series"]=="b")
-    y_ion_count = sum(1 for ion in main_ions if ion["series"]=="y")
+    b_ion_count = sum(1 for ion in main_ions if ion["series"] == "b")
+    y_ion_count = sum(1 for ion in main_ions if ion["series"] == "y")
 
     # 初始化特征为 0.0
     feat = {name: 0.0 for name in FRAGMENT_FEATURE_NAMES}
@@ -750,9 +777,9 @@ def compute_fragment_features(seq, charge, spec, theo_cache):
 
     # 记录不同容差下的命中数量
     matched_counts = {
-        10.0:{"b": 0, "y": 0, "total": 0},
+        10.0: {"b": 0, "y": 0, "total": 0},
         20.0: {"b": 0, "y": 0, "total": 0},
-        50.0: {"b": 0, "y": 0, "total": 0}
+        50.0: {"b": 0, "y": 0, "total": 0},
     }
 
     # 记录 20ppm 命中的峰下标
@@ -801,9 +828,10 @@ def compute_fragment_features(seq, charge, spec, theo_cache):
 
             # 记录 1+ b/y 离子匹配结果，用于统计 ladder 特征
             if 0 <= pos_idx < position_count and int(ion["charge"]) == 1:
-                if ion["series"] == "b":  b1_hits[pos_idx] = True
-                elif ion["series"] == "y": y1_hits[pos_idx] = True
-
+                if ion["series"] == "b":
+                    b1_hits[pos_idx] = True
+                elif ion["series"] == "y":
+                    y1_hits[pos_idx] = True
 
     # --------------------------------------------------------------------
     # neutral loss 离子匹配
@@ -828,7 +856,7 @@ def compute_fragment_features(seq, charge, spec, theo_cache):
         feat[f"matched_y_count_{suffix}"] = int(y_count)
         feat[f"matched_total_count_{suffix}"] = int(total_count)
 
-        # 计算命中比例： 命中离子数 / 理论离子数
+        # 计算命中比例：命中离子数 / 理论离子数
         feat[f"matched_b_fraction_{suffix}"] = safe_div(b_count, b_ion_count)
         feat[f"matched_y_fraction_{suffix}"] = safe_div(y_count, y_ion_count)
         feat[f"matched_total_fraction_{suffix}"] = safe_div(total_count, main_ion_count)
@@ -909,8 +937,7 @@ def compute_fragment_features(seq, charge, spec, theo_cache):
     feat["longest_combined_ladder_20ppm"] = int(max(longest_b, longest_y))
 
     if position_count > 0:
-        # b/y complement pair：
-        # 同一个 cleavage 位置上，b 离子和 y 离子都命中。
+        # b/y complement pair：同一个 cleavage 位置上，b 离子和 y 离子都命中。
         feat["b_y_complement_pair_count_20ppm"] = int(
             sum(1 for b_hit, y_hit in zip(b1_hits, y1_hits) if b_hit and y_hit)
         )
@@ -922,7 +949,6 @@ def compute_fragment_features(seq, charge, spec, theo_cache):
         feat["c_terminal_coverage_20ppm"] = safe_div(sum(y1_hits), position_count)
 
     return feat
-
 
 
 INT_FRAGMENT_FEATURE_COLS = [
@@ -1151,6 +1177,33 @@ def add_fragment_feature(path: Path):
     print(f"b/y 特征添加完成：{path}")
     print(f"行数：{row_count}")
 
+
+def run_one_file_subprocess(path: Path):
+    """
+    一个子进程处理一个 parquet 文件。
+    外层 ThreadPoolExecutor 只是负责同时等待多个子进程；真正计算发生在子进程里。
+    """
+    env = os.environ.copy()
+
+    # 每个子进程内部保持单线程，避免 N 个进程 × 每进程很多线程导致线程爆炸。
+    env["POLARS_MAX_THREADS"] = "1"
+    env["OMP_NUM_THREADS"] = "1"
+    env["MKL_NUM_THREADS"] = "1"
+    env["OPENBLAS_NUM_THREADS"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "--one-file", str(path)],
+        env=env,
+    )
+
+    if result.returncode != 0:
+        cleanup_tmp_file(path.with_name(path.name + TMP_SUFFIX))
+        return str(path), False, f"子进程退出码：{result.returncode}"
+
+    return str(path), True, ""
+
+
 def main():
     all_files = []
     for dir in PROCESSED_DIRS:
@@ -1166,37 +1219,53 @@ def main():
     print(f"共需要处理 {len(all_files)} 个文件")
     failed = []
 
-    for path in tqdm(all_files):
-        try:
-            if RUN_EACH_FILE_IN_SUBPROCESS:
-                env = os.environ.copy()
-                env.setdefault("POLARS_MAX_THREADS", "1")
-                env.setdefault("OMP_NUM_THREADS", "1")
-                env.setdefault("MKL_NUM_THREADS", "1")
-                env.setdefault("OPENBLAS_NUM_THREADS", "1")
-                env.setdefault("PYTHONUNBUFFERED", "1")
+    if len(all_files) == 0:
+        print("处理完成")
+        print("无失败文件")
+        return
 
-                result = subprocess.run(
-                    [sys.executable, str(Path(__file__).resolve()), "--one-file", str(path)],
-                    env=env,
-                )
+    if RUN_EACH_FILE_IN_SUBPROCESS:
+        workers = max(1, min(MAX_PARALLEL_FILES, len(all_files)))
+        print(f"并行处理 parquet 文件数：{workers}")
+        print("提示：可用 AIPC_WORKERS=12 这样的环境变量调整并行数。")
 
-                if result.returncode != 0:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_path = {
+                executor.submit(run_one_file_subprocess, path): path
+                for path in all_files
+            }
+
+            for future in tqdm(as_completed(future_to_path), total=len(future_to_path)):
+                path = future_to_path[future]
+
+                try:
+                    path_str, ok, msg = future.result()
+
+                    if not ok:
+                        failed.append(path_str)
+                        print(f"处理失败：{path_str}")
+                        print(msg)
+
+                except Exception as e:
                     failed.append(str(path))
                     print(f"处理失败：{path}")
-                    print(f"子进程退出码：{result.returncode}")
+                    print(f"错误信息：{e}")
                     cleanup_tmp_file(path.with_name(path.name + TMP_SUFFIX))
-            else:
+
+                gc.collect()
+
+    else:
+        for path in tqdm(all_files):
+            try:
                 add_fragment_feature(path)
+                gc.collect()
 
-            gc.collect()
-
-        except Exception as e:
-            failed.append(str(path))
-            print(f"处理失败：{path}")
-            print(f"错误信息：{e}")
-            cleanup_tmp_file(path.with_name(path.name + TMP_SUFFIX))
-            gc.collect()
+            except Exception as e:
+                failed.append(str(path))
+                print(f"处理失败：{path}")
+                print(f"错误信息：{e}")
+                cleanup_tmp_file(path.with_name(path.name + TMP_SUFFIX))
+                gc.collect()
 
     print("处理完成")
 
@@ -1207,8 +1276,10 @@ def main():
     else:
         print("无失败文件")
 
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--one-file":
         add_fragment_feature(Path(sys.argv[2]))
     else:
         main()
+

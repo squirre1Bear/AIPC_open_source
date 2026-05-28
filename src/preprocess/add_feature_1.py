@@ -2,10 +2,13 @@
 from pathlib import Path
 
 import os
-os.environ.setdefault("POLARS_MAX_THREADS", "1")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+# 必须放在 import polars / numpy 前面
+# 每个子进程只允许底层库使用 1 个线程，20 个子进程 ≈ 20 CPU 并行
+os.environ["POLARS_MAX_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 import sys
 import subprocess
@@ -15,13 +18,27 @@ import math
 import polars as pl
 import re
 import gc
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 # 路径
 PRODESSED_DIRS = [
-    Path(r"E:\AIPC_dataset\processed\mzml_merged"),
-    Path(r"E:\AIPC_dataset\processed\tims_merged"),
-    Path(r"E:\AIPC_dataset\processed\wiff_merged")
+    Path(r"/root/autodl-tmp/datasets/aipc/processed/mzml_merged"),
+    Path(r"/root/autodl-tmp/datasets/aipc/processed/tims_merged"),
+    Path(r"/root/autodl-tmp/datasets/aipc/processed/wiff_merged"),
 ]
+
+# PRODESSED_DIRS = [
+#     Path(r"E:\AIPC_dataset\processed\mzml_merged"),
+#     Path(r"E:\AIPC_dataset\processed\tims_merged"),
+#     Path(r"E:\AIPC_dataset\processed\wiff_merged")
+# ]
+
+# 并行处理文件数
+# 每个 parquet 文件放到一个独立子进程中处理
+# 每个子进程内部 Polars / BLAS 限制为 1 线程
+# 因此 N_WORKERS=20 时，大约就是 20 CPU 并行
+N_WORKERS = 20
 
 # 选择是否要备份
 MAKE_BACKUP = False
@@ -38,7 +55,7 @@ TOPK_PEAKS = 500
 RUN_EACH_FILE_IN_SUBPROCESS = True
 
 # 修复了肽段解析逻辑，需要设为 True，强制重新计算并覆盖。
-FORCE_REBUILD_AUX_FEATURES = True
+FORCE_REBUILD_AUX_FEATURES = False
 
 # 只读取本脚本需要的列，避免把 parquet 里的无关列全部读进内存
 NEEDED_COLS = [
@@ -92,7 +109,7 @@ AA_MASS = {
     "T": 101.047678505,
     "W": 186.079312980,
     "Y": 163.063328575,
-    "V": 99.068413945
+    "V": 99.068413945,
 }
 
 MOD_MASS = {
@@ -125,7 +142,7 @@ MOD_MASS = {
     "itraq8plex": 304.205360,
 
     "label:13c(6)15n(2)": 8.014199,
-    "label:13c(6)15n(4)": 10.008269
+    "label:13c(6)15n(4)": 10.008269,
 }
 
 
@@ -150,7 +167,6 @@ def keep_topk_peaks(mz_array, intensity_array, topk=TOPK_PEAKS):
         return [], []
 
     try:
-        # 这里仍然先用 float32 计算，减少 numpy 临时数组内存
         mz = np.asarray(mz_array, dtype=np.float32)
         intensity = np.asarray(intensity_array, dtype=np.float32)
 
@@ -176,9 +192,6 @@ def keep_topk_peaks(mz_array, intensity_array, topk=TOPK_PEAKS):
     mz = mz[order]
     intensity = intensity[order]
 
-    # 注意：tolist() 后会变成 Python float。
-    # Polars 会把 Python float 推断成 Float64。
-    # 所以后面 map_elements 的 return_dtype 要先声明 Float64，再 cast 成 Float32。
     return mz.tolist(), intensity.tolist()
 
 
@@ -186,25 +199,16 @@ def trim_spectrum_struct(s):
     new_mz, new_intensity = keep_topk_peaks(
         s["mz_array"],
         s["intensity_array"],
-        TOPK_PEAKS
+        TOPK_PEAKS,
     )
 
     return {
         "mz_array": new_mz,
-        "intensity_array": new_intensity
+        "intensity_array": new_intensity,
     }
 
 
 def parse_numeric_mass(text: str):
-    """
-    从修饰字符串中提取数字质量。
-    例如：
-        57.02
-        42
-        +15.9949
-        -17.0265
-        mass=57.02
-    """
     text = str(text).strip()
     m = re.search(r"[-+]?\d+(?:\.\d+)?", text)
 
@@ -215,9 +219,6 @@ def parse_numeric_mass(text: str):
 
 
 def normalize_mod_name(name: str) -> str:
-    """
-    标准化修饰名称。
-    """
     name = str(name).strip()
     name = name.lower()
     name = name.replace("_", "")
@@ -225,35 +226,27 @@ def normalize_mod_name(name: str) -> str:
     return name
 
 
-# 常见数字修饰的精确质量修正。
-# 例如：
-#   C[57.02] 通常表示 Carbamidomethyl，精确质量为 57.021463735
-#   n[42] 通常表示 N 端 Acetyl，精确质量为 42.010564684
 COMMON_NUMERIC_MODS = [
-    (57.02, 57.021463735, 0.05),       # Carbamidomethyl / CAM
+    (57.02, 57.021463735, 0.05),
     (57.0, 57.021463735, 0.05),
 
-    (42.0, 42.010564684, 0.05),        # Acetyl
+    (42.0, 42.010564684, 0.05),
     (42.01, 42.010564684, 0.05),
 
-    (15.99, 15.99491461957, 0.05),     # Oxidation
+    (15.99, 15.99491461957, 0.05),
     (16.0, 15.99491461957, 0.05),
 
-    (79.97, 79.966330410, 0.05),       # Phospho
+    (79.97, 79.966330410, 0.05),
     (80.0, 79.966330410, 0.05),
 
-    (0.98, 0.984015585, 0.03),         # Deamidated
+    (0.98, 0.984015585, 0.03),
 
-    (-17.03, -17.026549101, 0.05),     # Gln -> pyro-Glu
-    (-18.01, -18.010564684, 0.05),     # Glu -> pyro-Glu / H2O loss
+    (-17.03, -17.026549101, 0.05),
+    (-18.01, -18.010564684, 0.05),
 ]
 
 
 def snap_numeric_mod_mass(x):
-    """
-    将 57.02、42 这类近似数字修饰修正到常见修饰的精确质量。
-    如果不在常见范围内，则保留原数字。
-    """
     if x is None:
         return None
 
@@ -267,17 +260,6 @@ def snap_numeric_mod_mass(x):
 
 
 def get_mod_delta(mod_text: str):
-    """
-    根据修饰文本获取质量偏移。
-    支持：
-        Oxidation
-        Carbamidomethyl
-        Acetyl
-        UNIMOD:35
-        57.02
-        42
-        +15.9949
-    """
     if mod_text is None:
         return None
 
@@ -295,13 +277,6 @@ def get_mod_delta(mod_text: str):
 
 
 def strip_flanking_aa(seq: str) -> str:
-    """
-    只处理真正的 K.PEPTIDE.R 格式。
-
-    关键点：
-    [57.02] 里的小数点不能当作分隔符。
-    所以这里只统计括号外的点。
-    """
     s = str(seq).strip()
 
     dot_positions = []
@@ -322,8 +297,6 @@ def strip_flanking_aa(seq: str) -> str:
     middle = s[dot_positions[0] + 1:dot_positions[1]]
     right = s[dot_positions[1] + 1:]
 
-    # 只有类似 K.PEPTIDE.R 才剥掉两侧氨基酸。
-    # 例如 K.n[42]PEPTIDE.R 会返回 n[42]PEPTIDE。
     if (
         len(left) == 1
         and len(right) == 1
@@ -337,21 +310,6 @@ def strip_flanking_aa(seq: str) -> str:
 
 
 def parse_peptide_features(seq):
-    """
-    解析 precursor_sequence，生成第一部分基础特征。
-
-    支持：
-        C[57.02]PEPTIDE
-        M[Oxidation]PEPTIDE
-        n[42]PEPTIDE
-        n[Acetyl]PEPTIDE
-        [Acetyl]-PEPTIDE
-        K.PEPTIDE.R
-        K.n[42]PEPTIDE.R
-
-    注意：
-        小写 n[42] 表示 N 端修饰，不是氨基酸 N。
-    """
     if seq is None or str(seq).strip() == "":
         return {
             "peptide_length": 0,
@@ -380,11 +338,6 @@ def parse_peptide_features(seq):
     while i < len(s):
         ch = s[i]
 
-        # ----------------------------------------------------
-        # 情况 0：处理 n[42]PEPTIDE / n[Acetyl]PEPTIDE
-        # 小写 n 表示 N-terminal，不是氨基酸 N。
-        # 只在字符串开头把 n[...] 当作 N 端修饰。
-        # ----------------------------------------------------
         if (
             ch == "n"
             and i == 0
@@ -414,19 +367,10 @@ def parse_peptide_features(seq):
             i = j + 1
             continue
 
-        # ----------------------------------------------------
-        # 情况 0.5：处理单独的小写 n 开头。
-        # 有些格式可能写成 nPEPTIDE，表示 N 端标记但无显式质量。
-        # 这种情况下跳过 n，不把它当作氨基酸 N。
-        # ----------------------------------------------------
         if ch == "n" and i == 0:
             i += 1
             continue
 
-        # ----------------------------------------------------
-        # 情况 0.6：处理 C 端修饰，例如 PEPTIDEc[17]
-        # 只有 c[...] 在末尾时，才当作 C 端修饰。
-        # ----------------------------------------------------
         if (
             ch == "c"
             and len(aa_list) > 0
@@ -459,9 +403,6 @@ def parse_peptide_features(seq):
                 i = j + 1
                 continue
 
-        # ----------------------------------------------------
-        # 情况 1：遇到独立修饰，例如 [Acetyl]-PEPTIDE
-        # ----------------------------------------------------
         if ch in ["[", "(", "{"]:
             open_ch = ch
             close_ch = {"[": "]", "(": ")", "{": "}"}[open_ch]
@@ -481,8 +422,6 @@ def parse_peptide_features(seq):
                 unknown_mod_count += 1
                 parse_ok = 0
             else:
-                # 如果还没有残基，这是 N 端修饰，先暂存。
-                # 如果已经有残基，对 neutral_mass 来说直接加总质量即可。
                 if len(aa_list) == 0:
                     pending_nterm_delta += delta
                 else:
@@ -491,11 +430,6 @@ def parse_peptide_features(seq):
             i = j + 1
             continue
 
-        # ----------------------------------------------------
-        # 情况 2：正常氨基酸
-        # 常规数据是大写；如果有小写氨基酸，也转成大写处理。
-        # 但 n[42] 已经在前面被拦截，所以不会误当成 N。
-        # ----------------------------------------------------
         aa_ch = ch.upper() if ch.isalpha() else ch
 
         if aa_ch in AA_MASS:
@@ -504,7 +438,6 @@ def parse_peptide_features(seq):
 
             mass = AA_MASS[aa]
 
-            # N 端修饰加到第一个真实残基质量上
             if len(aa_list) == 1 and pending_nterm_delta != 0.0:
                 mass += pending_nterm_delta
                 pending_nterm_delta = 0.0
@@ -512,7 +445,6 @@ def parse_peptide_features(seq):
             neutral_mass += mass
             i += 1
 
-            # 处理残基后的修饰，例如 C[57.02]、M[Oxidation]
             while i < len(s) and s[i] in ["[", "(", "{"]:
                 open_ch = s[i]
                 close_ch = {"[": "]", "(": ")", "{": "}"}[open_ch]
@@ -538,17 +470,10 @@ def parse_peptide_features(seq):
 
             continue
 
-        # ----------------------------------------------------
-        # 情况 3：分隔符，跳过
-        # ----------------------------------------------------
         if ch in ["-", "_", ".", " "]:
             i += 1
             continue
 
-        # ----------------------------------------------------
-        # 情况 4：未知字符。
-        # 不打印，避免几千万行数据刷屏拖慢速度。
-        # ----------------------------------------------------
         parse_ok = 0
         i += 1
 
@@ -558,10 +483,7 @@ def parse_peptide_features(seq):
         parse_ok = 0
         neutral_mass = None
 
-    # 如果 pending_nterm_delta 还有残留，说明只有修饰但没有真实残基
     if peptide_length > 0 and pending_nterm_delta != 0.0:
-        # 理论上不会走到这里，因为第一个残基会吃掉 pending。
-        # 保险起见，将它加到总质量。
         neutral_mass += pending_nterm_delta
         pending_nterm_delta = 0.0
 
@@ -639,11 +561,8 @@ def cleanup_tmp_file(tmp_path: Path):
 
 def build_unique_spectrum_safe(df: pl.DataFrame) -> pl.DataFrame:
     """
-    替代 Polars map_elements + Struct[List] 的写法。
-
-    原写法在大 List 列上会制造很高的内存峰值，并且在 Windows 上有概率触发
-    Polars/Arrow 底层 0xC0000005 崩溃。这里保留同样逻辑：每个 group_key 只
-    裁剪一次谱图，然后再 join 回原 df。
+    每个 group_key 只裁剪一次谱图，然后 join 回原 df。
+    避免在大 List 列上重复 map，降低内存峰值。
     """
     unique_spectrum_raw = (
         df
@@ -691,19 +610,17 @@ def build_unique_spectrum_safe(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def add_feature_1(path: Path):
-    print(f"正在处理 {path}")
+    print(f"正在处理 {path}", flush=True)
 
-    # 先只读 schema，避免为了检查 aux_feature_done 就把整个 parquet 读进内存
     schema_cols = pl.scan_parquet(path).collect_schema().names()
 
     if "aux_feature_done" in schema_cols and not FORCE_REBUILD_AUX_FEATURES:
-        print(f"已处理过，跳过：{path}")
+        print(f"已处理过，跳过：{path}", flush=True)
         return
 
     read_cols = [c for c in NEEDED_COLS if c in schema_cols]
     df = pl.read_parquet(path, columns=read_cols)
 
-    # 统一字段类型，尽量用 Float32 / Int8 降低内存
     df = cast_existing(df, {
         "precursor_mz": pl.Float32,
         "rt": pl.Float32,
@@ -719,11 +636,6 @@ def add_feature_1(path: Path):
         "label": pl.Int8,
     })
 
-    # -------------------------------------------------------
-    # 构建谱图相关特征，保留强度前 TOPK_PEAKS 个峰
-    # 每一个 group_key 只保留一次，避免对同一张谱图的多条 PSM 重复裁剪
-    # 这里避免手动 rows.append(...) 生成巨大 Python 列表
-
     unique_spectrum = build_unique_spectrum_safe(df)
 
     df = (
@@ -735,8 +647,6 @@ def add_feature_1(path: Path):
     del unique_spectrum
     gc.collect()
 
-    # -------------------------------------------------------
-    # 解析肽段特征
     peptide_feature = (
         df
         .select("precursor_sequence")
@@ -756,7 +666,7 @@ def add_feature_1(path: Path):
                     "hydrophobic_aa_count": pl.Int64,
                     "missed_cleavage_like": pl.Int64,
                     "parse_ok": pl.Int64,
-                })
+                }),
             )
             .alias("pep")
         )
@@ -816,7 +726,7 @@ def add_feature_1(path: Path):
     )
 
     if peptide_feature.height == 0:
-        print("peptide_feature长度为0，有误！")
+        print("peptide_feature长度为0，有误！", flush=True)
         del df
         del peptide_feature
         gc.collect()
@@ -827,8 +737,6 @@ def add_feature_1(path: Path):
     del peptide_feature
     gc.collect()
 
-    # -------------------------------------------------------
-    # 前体质量与同位素误差特征
     df = df.with_columns([
         (
             (pl.col("neutral_mass") + pl.col("charge") * PROTON) / pl.col("charge")
@@ -897,14 +805,14 @@ def add_feature_1(path: Path):
             * 1_000_000.0
         )
         .cast(pl.Float32)
-        .alias("ppm_iso_2")
+        .alias("ppm_iso_2"),
     ])
 
     df = df.with_columns([
         pl.col("ppm_iso_-1").abs().cast(pl.Float32).alias("abs_ppm_iso_-1"),
         pl.col("ppm_iso_0").abs().cast(pl.Float32).alias("abs_ppm_iso_0"),
         pl.col("ppm_iso_1").abs().cast(pl.Float32).alias("abs_ppm_iso_1"),
-        pl.col("ppm_iso_2").abs().cast(pl.Float32).alias("abs_ppm_iso_2")
+        pl.col("ppm_iso_2").abs().cast(pl.Float32).alias("abs_ppm_iso_2"),
     ])
 
     df = df.with_columns([
@@ -930,8 +838,6 @@ def add_feature_1(path: Path):
         .alias("best_isotope_offset")
     ])
 
-    # -------------------------------------------------------
-    # 归一化 RT。不同仪器 rt 范围可能不同，因此在文件内进行归一化
     stats = df.select([
         pl.col("rt").mean().alias("rt_mean"),
         pl.col("rt").std().alias("rt_std"),
@@ -1018,8 +924,6 @@ def add_feature_1(path: Path):
         .alias("ion_mobility_norm_in_file"),
     ])
 
-    # --------------------------------------------------------
-    # 填充训练辅助字段
     df = df.with_columns([
         pl.col("fp_q_value").is_not_null().cast(pl.Int8).alias("has_fp_q_value"),
 
@@ -1040,9 +944,6 @@ def add_feature_1(path: Path):
 
         pl.col("label").cast(pl.Int8),
     ])
-
-    # --------------------------------------------------------
-    # 所有字段按序输出
 
     all_cols = [
         "file_id",
@@ -1112,12 +1013,8 @@ def add_feature_1(path: Path):
     all_cols = [c for c in all_cols if c in df.columns] + remaining_cols
     df = df.select(all_cols)
 
-    # --------------------------------------------------------
-    # 先写入临时文件，之后覆盖掉原文件
-
     tmp_path = path.with_name(path.name + TMP_SUFFIX)
 
-    # 如果上一次异常退出留下了旧 tmp，先删除，避免误用半写入文件。
     cleanup_tmp_file(tmp_path)
 
     df = df.with_columns([
@@ -1135,7 +1032,6 @@ def add_feature_1(path: Path):
         if not is_valid_parquet_file(tmp_path):
             raise RuntimeError(f"临时 parquet 写入不完整：{tmp_path}")
 
-        # 写完后尽早释放 df
         del df
         df_deleted = True
         gc.collect()
@@ -1159,73 +1055,182 @@ def add_feature_1(path: Path):
                 del df
             except Exception:
                 pass
+
             gc.collect()
 
         cleanup_tmp_file(tmp_path)
         raise
 
-    print(f"特征构建完成：{path}")
-    print(f"行数：{row_count}")
-    print(f"列数：{col_count}")
+    print(f"特征构建完成：{path}", flush=True)
+    print(f"行数：{row_count}", flush=True)
+    print(f"列数：{col_count}", flush=True)
+
+
+def run_one_file_task(file: Path):
+    """
+    主进程中的任务函数。
+
+    默认使用 --one-file 模式启动独立子进程处理单个 parquet 文件。
+    这样可以保留崩溃隔离能力：
+    某个文件导致 Polars / Arrow 底层崩溃时，不会拖死整个主任务。
+    """
+    try:
+        if RUN_EACH_FILE_IN_SUBPROCESS:
+            env = os.environ.copy()
+            env["POLARS_MAX_THREADS"] = "1"
+            env["OMP_NUM_THREADS"] = "1"
+            env["MKL_NUM_THREADS"] = "1"
+            env["OPENBLAS_NUM_THREADS"] = "1"
+            env["PYTHONUNBUFFERED"] = "1"
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--one-file",
+                    str(file),
+                ],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            if result.returncode != 0:
+                cleanup_tmp_file(file.with_name(file.name + TMP_SUFFIX))
+
+                return {
+                    "status": "failed",
+                    "file": str(file),
+                    "returncode": result.returncode,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "error": f"子进程退出码：{result.returncode}",
+                }
+
+            return {
+                "status": "ok",
+                "file": str(file),
+                "returncode": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "error": "",
+            }
+
+        else:
+            add_feature_1(file)
+
+            return {
+                "status": "ok",
+                "file": str(file),
+                "returncode": 0,
+                "stdout": "",
+                "stderr": "",
+                "error": "",
+            }
+
+    except BaseException as e:
+        cleanup_tmp_file(file.with_name(file.name + TMP_SUFFIX))
+
+        return {
+            "status": "failed",
+            "file": str(file),
+            "returncode": -1,
+            "stdout": "",
+            "stderr": "",
+            "error": repr(e),
+        }
 
 
 def main():
     all_files = []
 
-    for dir in PRODESSED_DIRS:
-        # 注意：不要把上次异常残留的 .tmp_feature.parquet / .tmp_fragment.parquet
-        # 当作正常输入文件再次处理。
+    for processed_dir in PRODESSED_DIRS:
         files = [
-            p for p in sorted(dir.glob("*.parquet"))
+            p for p in sorted(processed_dir.glob("*.parquet"))
             if ".tmp" not in p.name and not p.name.endswith(".bak")
         ]
-        print(f"{dir} 找到 {len(files)} 个parquet文件")
+
+        print(f"{processed_dir} 找到 {len(files)} 个 parquet 文件")
         all_files.extend(files)
 
-    print(f"共找到 {len(all_files)} 个parquet文件")
+    print(f"共找到 {len(all_files)} 个 parquet 文件")
+
+    if len(all_files) == 0:
+        print("没有需要处理的文件")
+        return
+
+    max_workers = min(N_WORKERS, len(all_files))
+
+    print(f"并行子进程数：{max_workers}")
+    print("开始并行构建辅助特征...")
 
     failed = []
+    failed_logs = []
+    ok_count = 0
 
-    for file in tqdm(all_files):
-        try:
-            if RUN_EACH_FILE_IN_SUBPROCESS:
-                env = os.environ.copy()
-                env.setdefault("POLARS_MAX_THREADS", "1")
-                env.setdefault("OMP_NUM_THREADS", "1")
-                env.setdefault("MKL_NUM_THREADS", "1")
-                env.setdefault("OPENBLAS_NUM_THREADS", "1")
-                env.setdefault("PYTHONUNBUFFERED", "1")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_file = {
+            executor.submit(run_one_file_task, file): file
+            for file in all_files
+        }
 
-                result = subprocess.run(
-                    [sys.executable, str(Path(__file__).resolve()), "--one-file", str(file)],
-                    env=env,
+        for future in tqdm(
+            as_completed(future_to_file),
+            total=len(future_to_file),
+            desc="Adding aux features",
+        ):
+            file = future_to_file[future]
+
+            try:
+                result = future.result()
+            except BaseException as e:
+                failed.append(str(file))
+                cleanup_tmp_file(file.with_name(file.name + TMP_SUFFIX))
+
+                msg = (
+                    f"处理失败：{file}\n"
+                    f"主进程捕获异常：{repr(e)}"
+                )
+                failed_logs.append(msg)
+                tqdm.write(msg)
+                continue
+
+            if result["status"] == "ok":
+                ok_count += 1
+                tqdm.write(f"完成：{result['file']}")
+
+            else:
+                failed.append(result["file"])
+
+                msg = (
+                    f"处理失败：{result['file']}\n"
+                    f"{result['error']}\n"
+                    f"stdout:\n{result['stdout']}\n"
+                    f"stderr:\n{result['stderr']}"
                 )
 
-                if result.returncode != 0:
-                    failed.append(str(file))
-                    print()
-                    print(f"处理失败：{file}")
-                    print(f"子进程退出码：{result.returncode}")
-                    cleanup_tmp_file(file.with_name(file.name + TMP_SUFFIX))
-            else:
-                add_feature_1(file)
+                failed_logs.append(msg)
+                tqdm.write(msg)
 
             gc.collect()
 
-        except Exception as e:
-            failed.append(str(file))
-            print()
-            print(f"处理失败：{file}")
-            print(f"错误信息：{e}")
-            cleanup_tmp_file(file.with_name(file.name + TMP_SUFFIX))
-            gc.collect()
-
+    print("=" * 80)
     print("文件处理完成")
+    print(f"成功：{ok_count}")
+    print(f"失败：{len(failed)}")
 
     if len(failed) > 0:
         print("【以下文件处理失败】：")
         for f in failed:
             print(f)
+
+        log_path = Path.cwd() / "add_aux_features_failed.log"
+        log_text = ("\n\n" + "=" * 80 + "\n\n").join(failed_logs)
+        log_path.write_text(log_text, encoding="utf-8")
+
+        print(f"失败日志已保存到：{log_path}")
+
 
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--one-file":
