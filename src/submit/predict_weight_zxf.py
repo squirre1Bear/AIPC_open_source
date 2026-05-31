@@ -260,4 +260,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-# d /zhangxiaofan/test; python -m eval_fdr.predict_weight_zxf /zhangxiaofan/test/model/base/mp_rank_00_model_states.pt --parquet_dir /zhangxiaofan/test/bas_data --out_path /zhangxiaofan/test/base_pred
+# python -m eval_fdr.predict_weight_zxf /zhangxiaofan/test/model/base/mp_rank_00_model_states.pt --parquet_dir /zhangxiaofan/test/bas_data --out_path /zhangxiaofan/test/base_pred

@@ -1,0 +1,33 @@
+{
+  "basic_metrics": {
+    "auc": 0.6038548188361654,
+    "average_precision": 0.537875171116528,
+    "pred_mean": 0.3424566287466998,
+    "pred_std": 0.14950829394140455,
+    "label_mean": 0.360008
+  },
+  "sampled_fdr_metrics": {
+    "sample_valid_rows": 1000000,
+    "accepted_target_psm_at_1pct": 42884,
+    "accepted_unique_peptide_at_1pct": 27078,
+    "by_instrument": {
+      "mzml": {
+        "accepted_target_psm_at_1pct": 42884,
+        "accepted_unique_peptide_at_1pct": 27078
+      },
+      "tims": {
+        "accepted_target_psm_at_1pct": 0,
+        "accepted_unique_peptide_at_1pct": 0
+      },
+      "wiff": {
+        "accepted_target_psm_at_1pct": 0,
+        "accepted_unique_peptide_at_1pct": 0
+      }
+    }
+  },
+  "best_iteration": 1820,
+  "train_rows": 3000000,
+  "valid_rows": 1000000,
+  "positive_rate_train": 0.3416576666666667,
+  "positive_rate_valid": 0.360008
+}

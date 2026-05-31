@@ -1,0 +1,22 @@
+{
+  "objective": "binary",
+  "metric": [
+    "auc",
+    "binary_logloss"
+  ],
+  "boosting_type": "gbdt",
+  "learning_rate": 0.06,
+  "num_leaves": 63,
+  "max_depth": -1,
+  "min_data_in_leaf": 500,
+  "feature_fraction": 0.8,
+  "bagging_fraction": 0.8,
+  "bagging_freq": 1,
+  "lambda_l1": 0.0,
+  "lambda_l2": 10.0,
+  "max_bin": 127,
+  "force_col_wise": true,
+  "verbosity": -1,
+  "seed": 20260519,
+  "num_threads": 24
+}

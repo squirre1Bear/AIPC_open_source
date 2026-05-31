@@ -1,3 +1,4 @@
+# 添加仪器名、统一初始列名
 from pathlib import Path
 import polars as pl
 from tqdm import tqdm

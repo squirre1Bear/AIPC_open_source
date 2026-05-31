@@ -1,5 +1,5 @@
 # 统计 b/y 离子的匹配特征
-# AIPC_WORKERS=20 python src/preprocess/add_feature_2.py
+# AIPC_WORKERS=3 python src/preprocess/add_feature_2.py
 from pathlib import Path
 import os
 
@@ -23,18 +23,14 @@ from collections import OrderedDict
 import math
 
 # 服务器数据集在 /root/autodl-tmp/datasets/aipc/
-
-PROCESSED_DIRS = [
-    Path(r"/root/autodl-tmp/datasets/aipc/processed/mzml_merged"),
-    Path(r"/root/autodl-tmp/datasets/aipc/processed/tims_merged"),
-    Path(r"/root/autodl-tmp/datasets/aipc/processed/wiff_merged")
-]
-
-# # 上传 mzml 的时候可以本地先跑着 wiff
-# # 后面上传上去也可以跳过处理过了的文件
 # PROCESSED_DIRS = [
-#     Path(r"E:\AIPC_dataset\processed\wiff_merged")
+#     Path(r"/root/autodl-tmp/datasets/aipc/processed/mzml_merged"),
+#     Path(r"/root/autodl-tmp/datasets/aipc/processed/tims_merged"),
+#     Path(r"/root/autodl-tmp/datasets/aipc/processed/wiff_merged")
 # ]
+PROCESSED_DIRS = [
+    Path(r"/root/autodl-tmp/datasets/aipc/processed/bas_merged")
+]
 
 TMP_SUFFIX = ".tmp_fragment.parquet"
 MAKE_BACKUP = False

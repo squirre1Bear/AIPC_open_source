@@ -22,23 +22,20 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # 路径
-PRODESSED_DIRS = [
-    Path(r"/root/autodl-tmp/datasets/aipc/processed/mzml_merged"),
-    Path(r"/root/autodl-tmp/datasets/aipc/processed/tims_merged"),
-    Path(r"/root/autodl-tmp/datasets/aipc/processed/wiff_merged"),
-]
-
-# PRODESSED_DIRS = [
-#     Path(r"E:\AIPC_dataset\processed\mzml_merged"),
-#     Path(r"E:\AIPC_dataset\processed\tims_merged"),
-#     Path(r"E:\AIPC_dataset\processed\wiff_merged")
+# PROCESSED_DIRS = [
+#     Path(r"/root/autodl-tmp/datasets/aipc/processed/mzml_merged"),
+#     Path(r"/root/autodl-tmp/datasets/aipc/processed/tims_merged"),
+#     Path(r"/root/autodl-tmp/datasets/aipc/processed/wiff_merged"),
 # ]
+PROCESSED_DIRS = [
+    Path(r"/root/autodl-tmp/datasets/aipc/processed/bas_merged")
+]
 
 # 并行处理文件数
 # 每个 parquet 文件放到一个独立子进程中处理
 # 每个子进程内部 Polars / BLAS 限制为 1 线程
 # 因此 N_WORKERS=20 时，大约就是 20 CPU 并行
-N_WORKERS = 20
+N_WORKERS = 3
 
 # 选择是否要备份
 MAKE_BACKUP = False
@@ -56,6 +53,28 @@ RUN_EACH_FILE_IN_SUBPROCESS = True
 
 # 修复了肽段解析逻辑，需要设为 True，强制重新计算并覆盖。
 FORCE_REBUILD_AUX_FEATURES = False
+
+ORDER_AWARE_FEATURES = [
+    "scan_candidate_count",
+    "scan_candidate_count_log1p",
+    "candidate_order_in_scan",
+    "candidate_order_pct_in_scan",
+    "candidate_order_reciprocal",
+    "candidate_order_log1p",
+    "is_first_candidate_in_scan",
+    "is_top3_candidate_in_scan",
+    "abs_delta_rt_rank_in_scan",
+    "abs_delta_rt_rank_pct_in_scan",
+    "is_best_abs_delta_rt_in_scan",
+    "abs_delta_rt_min_in_scan",
+    "abs_delta_rt_mean_in_scan",
+    "abs_delta_rt_std_in_scan",
+    "abs_delta_rt_gap_to_best_in_scan",
+    "abs_delta_rt_z_in_scan",
+    "candidate_order_rt_rank_gap",
+    "abs_candidate_order_rt_rank_gap",
+    "candidate_order_matches_abs_delta_rank",
+]
 
 # 只读取本脚本需要的列，避免把 parquet 里的无关列全部读进内存
 NEEDED_COLS = [
@@ -614,12 +633,17 @@ def add_feature_1(path: Path):
 
     schema_cols = pl.scan_parquet(path).collect_schema().names()
 
-    if "aux_feature_done" in schema_cols and not FORCE_REBUILD_AUX_FEATURES:
+    missing_order_features = [c for c in ORDER_AWARE_FEATURES if c not in schema_cols]
+    if "aux_feature_done" in schema_cols and not FORCE_REBUILD_AUX_FEATURES and not missing_order_features:
         print(f"已处理过，跳过：{path}", flush=True)
         return
 
+    if "aux_feature_done" in schema_cols and missing_order_features:
+        print(f"检测到旧版 aux 特征缺少候选顺序特征，将重算：{missing_order_features[:5]}", flush=True)
+
     read_cols = [c for c in NEEDED_COLS if c in schema_cols]
     df = pl.read_parquet(path, columns=read_cols)
+    df = df.with_row_index("__input_row_order")
 
     df = cast_existing(df, {
         "precursor_mz": pl.Float32,
@@ -925,6 +949,70 @@ def add_feature_1(path: Path):
     ])
 
     df = df.with_columns([
+        pl.len().over("group_key").cast(pl.Int32).alias("scan_candidate_count"),
+        pl.col("__input_row_order")
+        .rank(method="ordinal", descending=False)
+        .over("group_key")
+        .cast(pl.Int32)
+        .alias("candidate_order_in_scan"),
+        pl.col("abs_delta_rt")
+        .rank(method="ordinal", descending=False)
+        .over("group_key")
+        .cast(pl.Int32)
+        .alias("abs_delta_rt_rank_in_scan"),
+        pl.col("abs_delta_rt").min().over("group_key").cast(pl.Float32).alias("abs_delta_rt_min_in_scan"),
+        pl.col("abs_delta_rt").mean().over("group_key").cast(pl.Float32).alias("abs_delta_rt_mean_in_scan"),
+        pl.col("abs_delta_rt").std().over("group_key").fill_null(0.0).cast(pl.Float32).alias("abs_delta_rt_std_in_scan"),
+    ])
+
+    df = df.with_columns([
+        pl.col("scan_candidate_count").log1p().cast(pl.Float32).alias("scan_candidate_count_log1p"),
+        pl.col("candidate_order_in_scan").log1p().cast(pl.Float32).alias("candidate_order_log1p"),
+        (1.0 / pl.col("candidate_order_in_scan").cast(pl.Float32)).cast(pl.Float32).alias("candidate_order_reciprocal"),
+        (
+            pl.when(pl.col("scan_candidate_count") > 1)
+            .then(
+                (pl.col("candidate_order_in_scan") - 1).cast(pl.Float32)
+                / (pl.col("scan_candidate_count") - 1).cast(pl.Float32)
+            )
+            .otherwise(0.0)
+            .cast(pl.Float32)
+            .alias("candidate_order_pct_in_scan")
+        ),
+        (
+            pl.when(pl.col("scan_candidate_count") > 1)
+            .then(
+                (pl.col("abs_delta_rt_rank_in_scan") - 1).cast(pl.Float32)
+                / (pl.col("scan_candidate_count") - 1).cast(pl.Float32)
+            )
+            .otherwise(0.0)
+            .cast(pl.Float32)
+            .alias("abs_delta_rt_rank_pct_in_scan")
+        ),
+        (pl.col("candidate_order_in_scan") == 1).cast(pl.Int8).alias("is_first_candidate_in_scan"),
+        (pl.col("candidate_order_in_scan") <= 3).cast(pl.Int8).alias("is_top3_candidate_in_scan"),
+        (pl.col("abs_delta_rt_rank_in_scan") == 1).cast(pl.Int8).alias("is_best_abs_delta_rt_in_scan"),
+        (pl.col("abs_delta_rt") - pl.col("abs_delta_rt_min_in_scan")).cast(pl.Float32).alias("abs_delta_rt_gap_to_best_in_scan"),
+        (
+            pl.when(pl.col("abs_delta_rt_std_in_scan") > 1e-12)
+            .then((pl.col("abs_delta_rt") - pl.col("abs_delta_rt_mean_in_scan")) / pl.col("abs_delta_rt_std_in_scan"))
+            .otherwise(0.0)
+            .cast(pl.Float32)
+            .alias("abs_delta_rt_z_in_scan")
+        ),
+        (pl.col("candidate_order_in_scan") - pl.col("abs_delta_rt_rank_in_scan"))
+        .cast(pl.Int32)
+        .alias("candidate_order_rt_rank_gap"),
+        (pl.col("candidate_order_in_scan") - pl.col("abs_delta_rt_rank_in_scan"))
+        .abs()
+        .cast(pl.Int32)
+        .alias("abs_candidate_order_rt_rank_gap"),
+        (pl.col("candidate_order_in_scan") == pl.col("abs_delta_rt_rank_in_scan"))
+        .cast(pl.Int8)
+        .alias("candidate_order_matches_abs_delta_rank"),
+    ])
+
+    df = df.with_columns([
         pl.col("fp_q_value").is_not_null().cast(pl.Int8).alias("has_fp_q_value"),
 
         pl.col("fp_q_value")
@@ -1003,11 +1091,34 @@ def add_feature_1(path: Path):
         "ion_mobility_z_in_file",
         "ion_mobility_norm_in_file",
 
+        "scan_candidate_count",
+        "scan_candidate_count_log1p",
+        "candidate_order_in_scan",
+        "candidate_order_pct_in_scan",
+        "candidate_order_reciprocal",
+        "candidate_order_log1p",
+        "is_first_candidate_in_scan",
+        "is_top3_candidate_in_scan",
+        "abs_delta_rt_rank_in_scan",
+        "abs_delta_rt_rank_pct_in_scan",
+        "is_best_abs_delta_rt_in_scan",
+        "abs_delta_rt_min_in_scan",
+        "abs_delta_rt_mean_in_scan",
+        "abs_delta_rt_std_in_scan",
+        "abs_delta_rt_gap_to_best_in_scan",
+        "abs_delta_rt_z_in_scan",
+        "candidate_order_rt_rank_gap",
+        "abs_candidate_order_rt_rank_gap",
+        "candidate_order_matches_abs_delta_rank",
+
         "has_fp_q_value",
         "fp_q_value_filled",
         "sage_score_filled",
         "spectrum_q_filled",
     ]
+
+    if "__input_row_order" in df.columns:
+        df = df.drop("__input_row_order")
 
     remaining_cols = [c for c in df.columns if c not in all_cols]
     all_cols = [c for c in all_cols if c in df.columns] + remaining_cols
