@@ -1,15 +1,7 @@
 # python src/model/train_lightGBM_v2_groupaware.py \
 #   --data-root /root/autodl-tmp/datasets/aipc \
 #   --v1-model-dir ~/aipc/models/lgbm_v1_oof \
-#   --out-dir ~/aipc/models/lgbm_v2_binary \
-#   --num-threads 12
-#   --mode binary
-#
-# python src/model/train_lightGBM_v2_groupaware.py \
-#   --data-root /root/autodl-tmp/datasets/aipc \
-#   --v1-model-dir ~/aipc/models/lgbm_v1_oof \
-#   --out-dir ~/aipc/models/lgbm_v2_rank \
-#   --mode rank \
+#   --out-dir ~/aipc/models/lgbm_v2_ranker \
 #   --rank-objective lambdarank \
 #   --label-gain 0,1,4 \
 #   --eval-at 1,3,5,10
@@ -30,16 +22,6 @@ import polars as pl
 from sklearn.metrics import average_precision_score, roc_auc_score
 from tqdm import tqdm
 
-from train_lightGBM_v2 import (  # reuse the current v2 feature contract
-    CATEGORICAL_FEATURES,
-    GROUP_FEATURE_COLS,
-    ID_COLUMNS_FOR_VALID,
-    instrument_to_id_expr,
-    list_split_files,
-    load_v1_feature_columns,
-    resolve_v2_feature_columns,
-    split_files_by_instrument,
-)
 from fdr_training_metric import (
     FdrEvalMetadata,
     UniquePeptideFdrEarlyStopping,
@@ -48,6 +30,54 @@ from fdr_training_metric import (
 
 
 INSTRUMENTS = ["mzml", "tims", "wiff"]
+
+CATEGORICAL_FEATURES = {
+    "instrument_id",
+    "charge",
+    "has_ion_mobility",
+    "has_mod",
+    "parse_ok",
+    "fragment_parse_ok",
+    "best_isotope_offset",
+    "is_first_candidate_in_scan",
+    "is_top3_candidate_in_scan",
+    "is_best_abs_delta_rt_in_scan",
+    "candidate_order_matches_abs_delta_rank",
+    "scan_has_multiple_charges",
+    "is_first_candidate_for_charge_in_scan",
+    "is_lgbm_v1_group_top1",
+    "is_lgbm_v1_group_top3",
+}
+
+ID_COLUMNS_FOR_VALID = [
+    "file_id",
+    "instrument",
+    "scan_number",
+    "group_key",
+    "peptide_key",
+    "precursor_sequence",
+]
+
+GROUP_FEATURE_COLS = [
+    "lgbm_v1_score",
+    "lgbm_v1_group_size",
+    "lgbm_v1_group_rank",
+    "lgbm_v1_group_rank_pct",
+    "lgbm_v1_group_max",
+    "lgbm_v1_group_min",
+    "lgbm_v1_group_mean",
+    "lgbm_v1_group_std",
+    "lgbm_v1_group_top2",
+    "lgbm_v1_gap_to_top1",
+    "lgbm_v1_gap_to_top2",
+    "lgbm_v1_top1_margin",
+    "lgbm_v1_minus_group_mean",
+    "lgbm_v1_z_in_group",
+    "lgbm_v1_softmax_in_group",
+    "is_lgbm_v1_group_top1",
+    "is_lgbm_v1_group_top3",
+]
+
 HIGH_CONF_COLUMNS = ["in_fp", "fp_q_value", "spectrum_q"]
 GROUP_META_COLUMNS = [
     "group_key",
@@ -57,6 +87,84 @@ GROUP_META_COLUMNS = [
     "fp_q_value",
     "spectrum_q",
 ]
+
+
+def instrument_to_id_expr() -> pl.Expr:
+    return (
+        pl.when(pl.col("instrument") == "mzml")
+        .then(pl.lit(0))
+        .when(pl.col("instrument") == "tims")
+        .then(pl.lit(1))
+        .when(pl.col("instrument") == "wiff")
+        .then(pl.lit(2))
+        .otherwise(pl.lit(-1))
+        .cast(pl.Int8)
+        .alias("instrument_id")
+    )
+
+
+def list_split_files(split_root: Path) -> List[Path]:
+    files = []
+    for instrument in INSTRUMENTS:
+        instrument_dir = split_root / instrument
+        if not instrument_dir.exists():
+            print(f"目录不存在，跳过: {instrument_dir}")
+            continue
+        files.extend(
+            p for p in sorted(instrument_dir.glob("*.parquet"))
+            if ".tmp" not in p.name and not p.name.endswith(".bak")
+        )
+    return files
+
+
+def split_files_by_instrument(files: List[Path]) -> Dict[str, List[Path]]:
+    grouped = {instrument: [] for instrument in INSTRUMENTS}
+    for path in files:
+        parts = {part.lower() for part in path.parts}
+        matched = None
+        for instrument in INSTRUMENTS:
+            if path.parent.name.lower() == instrument or instrument in parts or path.name.lower().startswith(instrument):
+                matched = instrument
+                break
+        if matched is None:
+            raise RuntimeError(f"无法从路径判断仪器类型: {path}")
+        grouped[matched].append(path)
+    return grouped
+
+
+def load_v1_feature_columns(v1_model_dir: Path) -> List[str]:
+    feature_file = v1_model_dir / "feature_columns.json"
+    if not feature_file.exists():
+        raise FileNotFoundError(f"找不到 v1 feature_columns.json: {feature_file}")
+    with open(feature_file, "r", encoding="utf-8") as handle:
+        feature_cols = json.load(handle)
+    if not isinstance(feature_cols, list) or not feature_cols:
+        raise RuntimeError(f"v1 feature_columns.json 内容异常: {feature_file}")
+    return [str(col) for col in feature_cols]
+
+
+def resolve_v2_feature_columns(files: List[Path], v1_feature_cols: List[str]) -> List[str]:
+    available_cols = set()
+    for path in files[: min(len(files), 30)]:
+        available_cols.update(get_schema_cols(path))
+
+    missing_group_cols = [col for col in GROUP_FEATURE_COLS if col not in available_cols]
+    if missing_group_cols:
+        raise RuntimeError(
+            "训练 v2 ranker 前必须先生成 v1 group 特征，缺少列: "
+            f"{missing_group_cols[:30]}"
+        )
+
+    feature_cols = []
+    for col in v1_feature_cols:
+        if col == "instrument_id" or col in available_cols:
+            feature_cols.append(col)
+    feature_cols.extend(GROUP_FEATURE_COLS)
+
+    deduped = list(dict.fromkeys(feature_cols))
+    if "lgbm_v1_score" not in deduped:
+        raise RuntimeError("v2 特征缺少 lgbm_v1_score，请先运行 add_group_feature_oof/test")
+    return deduped
 
 
 def parse_int_list(text: str) -> List[int]:
@@ -590,23 +698,6 @@ def train_model(args, feature_cols, train_df, valid_df, train_groups, valid_grou
                 f"label_gain 长度不足: max label={max_rel_label}, label_gain={label_gain}"
             )
 
-        train_set = lgb.Dataset(
-            train_features,
-            label=train_label,
-            group=train_groups,
-            feature_name=feature_cols,
-            categorical_feature=categorical_features,
-            free_raw_data=False,
-        )
-        valid_set = lgb.Dataset(
-            valid_features,
-            label=valid_label,
-            group=valid_groups,
-            feature_name=feature_cols,
-            categorical_feature=categorical_features,
-            reference=train_set,
-            free_raw_data=False,
-        )
         params = {
             "objective": args.rank_objective,
             "metric": "None",
@@ -628,6 +719,35 @@ def train_model(args, feature_cols, train_df, valid_df, train_groups, valid_grou
             "seed": args.seed,
             "num_threads": args.num_threads,
         }
+
+        fdr_stopper = UniquePeptideFdrEarlyStopping(
+            valid_features=valid_features,
+            valid_meta=FdrEvalMetadata.from_frame(
+                valid_df,
+                fdr_threshold=args.fdr_threshold,
+                conservative_tdc=not args.non_conservative_zero_decoy,
+            ),
+            stopping_rounds=args.early_stopping_rounds,
+            eval_period=args.fdr_eval_period,
+            min_delta=args.fdr_min_delta,
+        )
+
+        ranker = lgb.LGBMRanker(**params, n_estimators=args.num_boost_round)
+        ranker.fit(
+            train_features,
+            train_label,
+            group=train_groups,
+            eval_set=[(valid_features, valid_label)],
+            eval_group=[valid_groups],
+            feature_name=feature_cols,
+            categorical_feature=categorical_features,
+            callbacks=[fdr_stopper],
+        )
+
+        booster = ranker.booster_
+        best_iteration = resolve_best_iteration(booster, fdr_stopper, args.num_boost_round)
+        valid_pred = booster.predict(valid_features, num_iteration=best_iteration)
+        return booster, params, valid_pred, fdr_stopper, best_iteration
 
     fdr_stopper = UniquePeptideFdrEarlyStopping(
         valid_features=valid_features,
@@ -676,7 +796,13 @@ def main():
     parser.add_argument("--data-root", type=str, default="/root/autodl-tmp/datasets/aipc")
     parser.add_argument("--v1-model-dir", type=str, default="~/aipc/models/lgbm_v1_oof")
     parser.add_argument("--out-dir", type=str, default="~/aipc/models/lgbm_v2_groupaware")
-    parser.add_argument("--mode", choices=["binary", "rank"], default="binary")
+    parser.add_argument(
+        "--only-instrument",
+        choices=INSTRUMENTS,
+        default=None,
+        help="只使用某一种仪器的数据训练/验证；用于分别训练 mzml/tims/wiff 三个专用模型。",
+    )
+    parser.add_argument("--mode", choices=["binary", "rank"], default="rank")
     parser.add_argument("--rank-objective", choices=["lambdarank", "rank_xendcg"], default="lambdarank")
     parser.add_argument("--label-gain", type=str, default="0,1,4")
     parser.add_argument("--eval-at", type=str, default="1,3,5,10")
@@ -700,7 +826,17 @@ def main():
     parser.add_argument("--hard-group-frac", type=float, default=0.45)
     parser.add_argument("--high-conf-group-frac", type=float, default=0.25)
     parser.add_argument("--hard-margin", type=float, default=0.03)
-    parser.add_argument("--prefer-informative-groups", action="store_true")
+    parser.add_argument(
+        "--prefer-informative-groups",
+        action="store_true",
+        default=True,
+        help="默认开启：ranker 训练优先采样同一 scan 内同时含 target 和 decoy 的 group。",
+    )
+    parser.add_argument(
+        "--allow-uninformative-groups",
+        action="store_true",
+        help="关闭 informative-only 偏好，允许采样全 target 或全 decoy group。",
+    )
     parser.add_argument("--high-rel-label", type=int, default=2)
     parser.add_argument("--hard-decoy-weight", type=float, default=2.5)
     parser.add_argument("--high-target-weight", type=float, default=2.5)
@@ -718,6 +854,9 @@ def main():
     parser.add_argument("--lambdarank-truncation-level", type=int, default=10)
     args = parser.parse_args()
 
+    if args.allow_uninformative_groups:
+        args.prefer_informative_groups = False
+
     if args.hard_group_frac < 0 or args.high_conf_group_frac < 0 or args.hard_group_frac + args.high_conf_group_frac > 0.95:
         raise ValueError("hard/high-conf group fraction 配置不合理")
 
@@ -731,8 +870,13 @@ def main():
 
     train_files = list_split_files(train_root)
     valid_files = list_split_files(valid_root)
+    if args.only_instrument is not None:
+        train_files = split_files_by_instrument(train_files)[args.only_instrument]
+        valid_files = split_files_by_instrument(valid_files)[args.only_instrument]
     if not train_files or not valid_files:
-        raise RuntimeError("train 或 valid 文件为空")
+        raise RuntimeError(
+            f"train 或 valid 文件为空: only_instrument={args.only_instrument}"
+        )
 
     v1_feature_cols = load_v1_feature_columns(v1_model_dir)
     feature_cols = resolve_v2_feature_columns(train_files, v1_feature_cols)
@@ -744,6 +888,7 @@ def main():
 
     print("========== group-aware v2 ==========")
     print("mode:", args.mode)
+    print("only_instrument:", args.only_instrument or "all")
     print("data_root:", data_root)
     print("v1_model_dir:", v1_model_dir)
     print("out_dir:", out_dir)
