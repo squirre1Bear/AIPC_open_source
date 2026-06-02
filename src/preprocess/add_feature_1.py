@@ -1,4 +1,14 @@
-# 添加前体质量相关特征、RT 归一化等
+  # cd ~/aipc
+  # source ~/miniconda3/etc/profile.d/conda.sh
+  # conda activate aipc
+  # export DATA=/root/autodl-tmp/datasets/aipc
+  #
+  # python src/preprocess/add_feature_1.py --dirs \
+  #   $DATA/processed_split/train/mzml $DATA/processed_split/train/tims $DATA/processed_split/train/wiff \
+  #   $DATA/processed_split/valid/mzml $DATA/processed_split/valid/tims $DATA/processed_split/valid/wiff \
+  #   $DATA/processed/bas_merged
+
+# 添加前体质量相关特征、RT 归一化，以及组内顺序特征等
 from pathlib import Path
 
 import os
@@ -12,6 +22,7 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 import sys
 import subprocess
+import argparse
 import numpy as np
 from tqdm import tqdm
 import math
@@ -34,8 +45,7 @@ PROCESSED_DIRS = [
 # 并行处理文件数
 # 每个 parquet 文件放到一个独立子进程中处理
 # 每个子进程内部 Polars / BLAS 限制为 1 线程
-# 因此 N_WORKERS=20 时，大约就是 20 CPU 并行
-N_WORKERS = 3
+N_WORKERS = 12
 
 # 选择是否要备份
 MAKE_BACKUP = False
@@ -74,12 +84,20 @@ ORDER_AWARE_FEATURES = [
     "candidate_order_rt_rank_gap",
     "abs_candidate_order_rt_rank_gap",
     "candidate_order_matches_abs_delta_rank",
+    "scan_unique_charge_count",
+    "scan_has_multiple_charges",
+    "same_charge_candidate_count_in_scan",
+    "same_charge_candidate_fraction_in_scan",
+    "candidate_order_in_scan_charge",
+    "candidate_order_pct_in_scan_charge",
+    "is_first_candidate_for_charge_in_scan",
 ]
 
 # 只读取本脚本需要的列，避免把 parquet 里的无关列全部读进内存
 NEEDED_COLS = [
     "file_id",
     "instrument",
+    "index",
     "scan_number",
     "group_key",
     "precursor_sequence",
@@ -645,6 +663,18 @@ def add_feature_1(path: Path):
     df = pl.read_parquet(path, columns=read_cols)
     df = df.with_row_index("__input_row_order")
 
+    if "index" in df.columns:
+        df = df.with_columns(
+            pl.when(pl.col("index").is_not_null())
+            .then(pl.col("index").cast(pl.Int64))
+            .otherwise(pl.col("__input_row_order").cast(pl.Int64))
+            .alias("__candidate_source_order")
+        )
+    else:
+        df = df.with_columns(
+            pl.col("__input_row_order").cast(pl.Int64).alias("__candidate_source_order")
+        )
+
     df = cast_existing(df, {
         "precursor_mz": pl.Float32,
         "rt": pl.Float32,
@@ -950,7 +980,7 @@ def add_feature_1(path: Path):
 
     df = df.with_columns([
         pl.len().over("group_key").cast(pl.Int32).alias("scan_candidate_count"),
-        pl.col("__input_row_order")
+        pl.col("__candidate_source_order")
         .rank(method="ordinal", descending=False)
         .over("group_key")
         .cast(pl.Int32)
@@ -963,6 +993,13 @@ def add_feature_1(path: Path):
         pl.col("abs_delta_rt").min().over("group_key").cast(pl.Float32).alias("abs_delta_rt_min_in_scan"),
         pl.col("abs_delta_rt").mean().over("group_key").cast(pl.Float32).alias("abs_delta_rt_mean_in_scan"),
         pl.col("abs_delta_rt").std().over("group_key").fill_null(0.0).cast(pl.Float32).alias("abs_delta_rt_std_in_scan"),
+        pl.col("charge").n_unique().over("group_key").cast(pl.Int16).alias("scan_unique_charge_count"),
+        pl.len().over(["group_key", "charge"]).cast(pl.Int32).alias("same_charge_candidate_count_in_scan"),
+        pl.col("__candidate_source_order")
+        .rank(method="ordinal", descending=False)
+        .over(["group_key", "charge"])
+        .cast(pl.Int32)
+        .alias("candidate_order_in_scan_charge"),
     ])
 
     df = df.with_columns([
@@ -1010,6 +1047,26 @@ def add_feature_1(path: Path):
         (pl.col("candidate_order_in_scan") == pl.col("abs_delta_rt_rank_in_scan"))
         .cast(pl.Int8)
         .alias("candidate_order_matches_abs_delta_rank"),
+        (pl.col("scan_unique_charge_count") > 1).cast(pl.Int8).alias("scan_has_multiple_charges"),
+        (
+            pl.col("same_charge_candidate_count_in_scan").cast(pl.Float32)
+            / pl.col("scan_candidate_count").cast(pl.Float32)
+        )
+        .cast(pl.Float32)
+        .alias("same_charge_candidate_fraction_in_scan"),
+        (
+            pl.when(pl.col("same_charge_candidate_count_in_scan") > 1)
+            .then(
+                (pl.col("candidate_order_in_scan_charge") - 1).cast(pl.Float32)
+                / (pl.col("same_charge_candidate_count_in_scan") - 1).cast(pl.Float32)
+            )
+            .otherwise(0.0)
+            .cast(pl.Float32)
+            .alias("candidate_order_pct_in_scan_charge")
+        ),
+        (pl.col("candidate_order_in_scan_charge") == 1)
+        .cast(pl.Int8)
+        .alias("is_first_candidate_for_charge_in_scan"),
     ])
 
     df = df.with_columns([
@@ -1036,6 +1093,7 @@ def add_feature_1(path: Path):
     all_cols = [
         "file_id",
         "instrument",
+        "index",
         "scan_number",
         "group_key",
         "precursor_sequence",
@@ -1110,6 +1168,13 @@ def add_feature_1(path: Path):
         "candidate_order_rt_rank_gap",
         "abs_candidate_order_rt_rank_gap",
         "candidate_order_matches_abs_delta_rank",
+        "scan_unique_charge_count",
+        "scan_has_multiple_charges",
+        "same_charge_candidate_count_in_scan",
+        "same_charge_candidate_fraction_in_scan",
+        "candidate_order_in_scan_charge",
+        "candidate_order_pct_in_scan_charge",
+        "is_first_candidate_for_charge_in_scan",
 
         "has_fp_q_value",
         "fp_q_value_filled",
@@ -1117,12 +1182,31 @@ def add_feature_1(path: Path):
         "spectrum_q_filled",
     ]
 
-    if "__input_row_order" in df.columns:
-        df = df.drop("__input_row_order")
+    tmp_order_cols = [
+        col_name for col_name in ["__input_row_order", "__candidate_source_order"]
+        if col_name in df.columns
+    ]
+    if tmp_order_cols:
+        df = df.drop(tmp_order_cols)
 
     remaining_cols = [c for c in df.columns if c not in all_cols]
     all_cols = [c for c in all_cols if c in df.columns] + remaining_cols
     df = df.select(all_cols)
+
+    recomputed_cols = set(df.columns) | {"aux_feature_done"}
+    preserve_cols = [
+        col_name for col_name in schema_cols
+        if col_name not in recomputed_cols
+    ]
+    if preserve_cols:
+        preserved_df = pl.read_parquet(path, columns=preserve_cols)
+        if preserved_df.height != df.height:
+            raise RuntimeError(
+                f"保留旧特征列时行数不一致：preserved={preserved_df.height}, current={df.height}, path={path}"
+            )
+        df = pl.concat([df, preserved_df], how="horizontal")
+        del preserved_df
+        gc.collect()
 
     tmp_path = path.with_name(path.name + TMP_SUFFIX)
 
@@ -1254,9 +1338,34 @@ def run_one_file_task(file: Path):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dirs",
+        nargs="+",
+        default=[str(path) for path in PROCESSED_DIRS],
+        help="要处理的 parquet 目录。默认使用脚本顶部 PROCESSED_DIRS。",
+    )
+    parser.add_argument(
+        "--one-file",
+        type=str,
+        default=None,
+        help="内部/调试参数：只处理单个 parquet 文件。",
+    )
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        default=None,
+        help="调试用，只处理前 N 个文件。",
+    )
+    args = parser.parse_args()
+
+    if args.one_file is not None:
+        add_feature_1(Path(args.one_file))
+        return
+
     all_files = []
 
-    for processed_dir in PRODESSED_DIRS:
+    for processed_dir in [Path(item) for item in args.dirs]:
         files = [
             p for p in sorted(processed_dir.glob("*.parquet"))
             if ".tmp" not in p.name and not p.name.endswith(".bak")
@@ -1264,6 +1373,9 @@ def main():
 
         print(f"{processed_dir} 找到 {len(files)} 个 parquet 文件")
         all_files.extend(files)
+
+    if args.max_files is not None:
+        all_files = all_files[: args.max_files]
 
     print(f"共找到 {len(all_files)} 个 parquet 文件")
 

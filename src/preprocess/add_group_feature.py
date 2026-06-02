@@ -176,6 +176,32 @@ def load_lgbm_model(model_dir: Path):
     return model
 
 
+def load_lgbm_models_and_feature_columns(model_dirs):
+    """
+    加载一个或多个 v1 模型。
+    多模型模式用于 valid/test 的 5-fold ensemble 打分。
+    """
+    model_dirs = [Path(p).expanduser() for p in model_dirs]
+
+    if not model_dirs:
+        raise ValueError("model_dirs 不能为空")
+
+    feature_cols = load_feature_columns(model_dirs[0])
+    models = []
+
+    for model_dir in model_dirs:
+        current_feature_cols = load_feature_columns(model_dir)
+        if current_feature_cols != feature_cols:
+            raise RuntimeError(
+                "fold 模型 feature_columns.json 不一致："
+                f"base={model_dirs[0]}, current={model_dir}"
+            )
+
+        models.append(load_lgbm_model(model_dir))
+
+    return models, feature_cols
+
+
 def prepare_feature_frame(path: Path, feature_cols):
     """
     只读取模型预测需要的列，以及 group_key。
@@ -237,6 +263,12 @@ def prepare_feature_frame(path: Path, feature_cols):
             "parse_ok",
             "fragment_parse_ok",
             "best_isotope_offset",
+            "is_first_candidate_in_scan",
+            "is_top3_candidate_in_scan",
+            "is_best_abs_delta_rt_in_scan",
+            "candidate_order_matches_abs_delta_rank",
+            "scan_has_multiple_charges",
+            "is_first_candidate_for_charge_in_scan",
         ]:
             cast_exprs.append(pl.col(c).cast(pl.Int16))
         else:
@@ -258,6 +290,29 @@ def predict_lgbm_scores(model, feature_df: pl.DataFrame, feature_cols):
         pred = model.predict(X)
 
     pred = np.asarray(pred, dtype=np.float32)
+
+    del X
+    gc.collect()
+
+    return pred
+
+
+def predict_lgbm_scores_ensemble(models, feature_df: pl.DataFrame, feature_cols):
+    X = feature_df.select(feature_cols).to_pandas()
+    X = X.replace([np.inf, -np.inf], np.nan)
+
+    pred_sum = np.zeros(feature_df.height, dtype=np.float64)
+
+    for model in models:
+        best_iter = getattr(model, "best_iteration", None)
+        if best_iter is not None and best_iter > 0:
+            pred = model.predict(X, num_iteration=best_iter)
+        else:
+            pred = model.predict(X)
+
+        pred_sum += np.asarray(pred, dtype=np.float64)
+
+    pred = (pred_sum / max(1, len(models))).astype(np.float32)
 
     del X
     gc.collect()
@@ -411,7 +466,7 @@ def build_group_feature_df(feature_df: pl.DataFrame, pred: np.ndarray) -> pl.Dat
     return out
 
 
-def add_group_features_to_file(path: Path, model_dir: Path, force: bool):
+def add_group_features_to_file_with_model_dirs(path: Path, model_dirs, force: bool):
     print(f"\n开始处理: {path}")
 
     schema_cols = set(get_schema_cols(path))
@@ -420,11 +475,18 @@ def add_group_features_to_file(path: Path, model_dir: Path, force: bool):
         print(f"已存在 group_feature_done，跳过: {path}")
         return
 
-    feature_cols = load_feature_columns(model_dir)
-    model = load_lgbm_model(model_dir)
+    model_dirs = [Path(p).expanduser() for p in model_dirs]
+    models, feature_cols = load_lgbm_models_and_feature_columns(model_dirs)
+
+    if len(model_dirs) == 1:
+        print(f"v1 score model: {model_dirs[0]}")
+    else:
+        print(f"v1 score ensemble models: {len(model_dirs)}")
+        for model_dir in model_dirs:
+            print(f"  - {model_dir}")
 
     feature_df = prepare_feature_frame(path, feature_cols)
-    pred = predict_lgbm_scores(model, feature_df, feature_cols)
+    pred = predict_lgbm_scores_ensemble(models, feature_df, feature_cols)
 
     group_feature_df = build_group_feature_df(feature_df, pred)
 
@@ -434,7 +496,7 @@ def add_group_features_to_file(path: Path, model_dir: Path, force: bool):
         )
 
     del pred
-    del model
+    del models
     del feature_df
     gc.collect()
 
@@ -494,6 +556,22 @@ def add_group_features_to_file(path: Path, model_dir: Path, force: bool):
     print(f"group 特征写入完成: {path}")
     print(f"行数: {row_count}")
     print(f"列数: {col_count}")
+
+
+def add_group_features_to_file(path: Path, model_dir: Path, force: bool):
+    add_group_features_to_file_with_model_dirs(
+        path=path,
+        model_dirs=[model_dir],
+        force=force,
+    )
+
+
+def add_group_features_to_file_ensemble(path: Path, model_dirs, force: bool):
+    add_group_features_to_file_with_model_dirs(
+        path=path,
+        model_dirs=model_dirs,
+        force=force,
+    )
 
 
 def run_one_file_subprocess(path: Path, model_dir: Path, force: bool):

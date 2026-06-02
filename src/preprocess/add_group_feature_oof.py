@@ -1,10 +1,10 @@
-# 生成 oof v1得分，防止给见过的数据预测分数
+# 给训练集生成 oof v1 得分，防止给见过的数据预测分数
 
 # python src/preprocess/add_group_feature_oof.py \
 #   --data-root /root/autodl-tmp/datasets/aipc \
 #   --fold-model-dir ~/aipc/models/lgbm_v1_oof \
-#   --full-model-dir ~/aipc/models/lgbm_v1 \
 #   --splits train valid \
+#   --workers=12
 #   --force
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import json
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 
@@ -28,12 +28,13 @@ if str(PREPROCESS_DIR) not in sys.path:
 from add_group_feature import (  # noqa: E402
     TMP_SUFFIX,
     add_group_features_to_file,
+    add_group_features_to_file_ensemble,
     cleanup_tmp_file,
     list_split_files,
 )
 
 
-MAX_PARALLEL_FILES = int(os.environ.get("AIPC_OOF_GROUP_WORKERS", "2"))
+MAX_PARALLEL_FILES = 12
 
 
 def load_fold_manifest(fold_model_dir: Path) -> Dict:
@@ -70,23 +71,46 @@ def path_key(path: Path, data_root: Path, split: str) -> str:
         return path.name
 
 
-def model_dir_for_file(
+def fold_model_dirs_from_manifest(fold_model_dir: Path, manifest: Dict) -> List[Path]:
+    n_folds = int(manifest["n_folds"])
+    model_dirs = [fold_model_dir / f"fold_{fold_id}" for fold_id in range(n_folds)]
+
+    missing = []
+    for model_dir in model_dirs:
+        if not (model_dir / "model.txt").exists():
+            missing.append(str(model_dir / "model.txt"))
+        if not (model_dir / "feature_columns.json").exists():
+            missing.append(str(model_dir / "feature_columns.json"))
+
+    if missing:
+        raise FileNotFoundError(
+            "OOF fold 模型不完整，无法进行 valid/test 5-fold ensemble。缺少："
+            + "; ".join(missing[:20])
+        )
+
+    return model_dirs
+
+
+def model_dirs_for_file(
     path: Path,
     split: str,
     data_root: Path,
     fold_model_dir: Path,
     full_model_dir: Path,
+    ensemble_model_dirs: List[Path],
     fold_map: Dict[str, int],
-) -> Tuple[Path, str]:
+) -> Tuple[List[Path], str]:
     if split != "train":
-        return full_model_dir, "full"
+        if full_model_dir is not None:
+            return [full_model_dir], "full"
+        return ensemble_model_dirs, f"fold_ensemble_{len(ensemble_model_dirs)}"
 
     key = path_key(path, data_root, split="train")
     if key not in fold_map:
         raise KeyError(f"folds.json 中找不到 train 文件: key={key}, path={path}")
 
     fold_id = fold_map[key]
-    return fold_model_dir / f"fold_{fold_id}", f"oof_fold_{fold_id}"
+    return [fold_model_dir / f"fold_{fold_id}"], f"oof_fold_{fold_id}"
 
 
 def process_one(
@@ -94,28 +118,34 @@ def process_one(
     split: str,
     data_root: Path,
     fold_model_dir: Path,
-    full_model_dir: Path,
+    full_model_dir: Optional[Path],
+    ensemble_model_dirs: List[Path],
     fold_map: Dict[str, int],
     force: bool,
 ) -> Tuple[str, bool, str]:
     try:
-        model_dir, source = model_dir_for_file(
+        model_dirs, source = model_dirs_for_file(
             path=path,
             split=split,
             data_root=data_root,
             fold_model_dir=fold_model_dir,
             full_model_dir=full_model_dir,
+            ensemble_model_dirs=ensemble_model_dirs,
             fold_map=fold_map,
         )
 
-        if not (model_dir / "model.txt").exists():
-            raise FileNotFoundError(f"找不到模型文件: {model_dir / 'model.txt'}")
+        for model_dir in model_dirs:
+            if not (model_dir / "model.txt").exists():
+                raise FileNotFoundError(f"找不到模型文件: {model_dir / 'model.txt'}")
 
-        if not (model_dir / "feature_columns.json").exists():
-            raise FileNotFoundError(f"找不到 feature_columns.json: {model_dir / 'feature_columns.json'}")
+            if not (model_dir / "feature_columns.json").exists():
+                raise FileNotFoundError(f"找不到 feature_columns.json: {model_dir / 'feature_columns.json'}")
 
         print(f"\n[{source}] {path}")
-        add_group_features_to_file(path=path, model_dir=model_dir, force=force)
+        if len(model_dirs) == 1:
+            add_group_features_to_file(path=path, model_dir=model_dirs[0], force=force)
+        else:
+            add_group_features_to_file_ensemble(path=path, model_dirs=model_dirs, force=force)
         return str(path), True, source
 
     except BaseException as e:
@@ -140,13 +170,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", type=str, default="/root/autodl-tmp/datasets/aipc")
     parser.add_argument("--fold-model-dir", type=str, default="~/aipc/models/lgbm_v1_oof")
-    parser.add_argument("--full-model-dir", type=str, default="~/aipc/models/lgbm_v1")
+    parser.add_argument(
+        "--full-model-dir",
+        type=str,
+        default="",
+        help="可选：如果提供，则 valid 使用该 full v1；默认 valid 使用 fold-model-dir 下所有 fold 做 ensemble。",
+    )
     parser.add_argument(
         "--splits",
         nargs="+",
         default=["train", "valid"],
         choices=["train", "valid"],
-        help="train 使用 OOF fold 模型；valid 使用 full v1 模型。",
+        help="train 使用对应 OOF fold 模型；valid 默认使用所有 fold 模型平均。",
     )
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--max-files", type=int, default=None)
@@ -155,10 +190,11 @@ def main():
 
     data_root = Path(args.data_root)
     fold_model_dir = Path(args.fold_model_dir).expanduser()
-    full_model_dir = Path(args.full_model_dir).expanduser()
+    full_model_dir = Path(args.full_model_dir).expanduser() if args.full_model_dir else None
 
     manifest = load_fold_manifest(fold_model_dir)
     fold_map = build_fold_map(manifest)
+    ensemble_model_dirs = fold_model_dirs_from_manifest(fold_model_dir, manifest)
 
     split_to_files = collect_files(data_root, args.splits, args.max_files)
     jobs = []
@@ -169,7 +205,11 @@ def main():
     print("========== OOF group feature ==========")
     print("data_root:", data_root)
     print("fold_model_dir:", fold_model_dir)
+    print("valid/test score mode:", "full" if full_model_dir is not None else f"fold_ensemble_{len(ensemble_model_dirs)}")
     print("full_model_dir:", full_model_dir)
+    print("ensemble_model_dirs:")
+    for model_dir in ensemble_model_dirs:
+        print("  ", model_dir)
     print("splits:", args.splits)
     print("force:", args.force)
     print("workers:", args.workers)
@@ -191,6 +231,7 @@ def main():
                 data_root,
                 fold_model_dir,
                 full_model_dir,
+                ensemble_model_dirs,
                 fold_map,
                 args.force,
             ): (split, path)
@@ -222,4 +263,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

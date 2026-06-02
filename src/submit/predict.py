@@ -1,8 +1,12 @@
 # python src/submit/predict.py \
-#   ~/aipc/models/lgbm_v2 \
+#   ~/aipc/models/lgbm_v1_oof \
 #   --parquet_dir /root/autodl-tmp/datasets/aipc/processed/bas_merged \
-#   --out_path /root/autodl-tmp/datasets/aipc/submissions/lgbm_v2
+#   --out_path /root/autodl-tmp/datasets/aipc/submissions/lgbm_v1_oof
 
+  # python src/submit/predict.py \
+  #   ~/aipc/models/lgbm_v2_binary \
+  #   --parquet_dir $DATA/processed/bas_merged \
+  #   --out_path /root/autodl-tmp/datasets/aipc/submissions/lgbm_v2_binary
 from __future__ import annotations
 
 import os
@@ -223,6 +227,12 @@ def prepare_feature_df(df: pl.DataFrame, feature_cols: list[str], file_name: str
         "parse_ok",
         "fragment_parse_ok",
         "best_isotope_offset",
+        "is_first_candidate_in_scan",
+        "is_top3_candidate_in_scan",
+        "is_best_abs_delta_rt_in_scan",
+        "candidate_order_matches_abs_delta_rank",
+        "scan_has_multiple_charges",
+        "is_first_candidate_for_charge_in_scan",
     }
 
     cast_exprs = []

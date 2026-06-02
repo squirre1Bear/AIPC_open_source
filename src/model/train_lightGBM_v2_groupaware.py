@@ -1,13 +1,14 @@
 # python src/model/train_lightGBM_v2_groupaware.py \
 #   --data-root /root/autodl-tmp/datasets/aipc \
-#   --v1-model-dir ~/aipc/models/lgbm_v1 \
-#   --out-dir ~/aipc/models/lgbm_v2_groupaware_binary \
+#   --v1-model-dir ~/aipc/models/lgbm_v1_oof \
+#   --out-dir ~/aipc/models/lgbm_v2_binary \
+#   --num-threads 12
 #   --mode binary
 #
 # python src/model/train_lightGBM_v2_groupaware.py \
 #   --data-root /root/autodl-tmp/datasets/aipc \
-#   --v1-model-dir ~/aipc/models/lgbm_v1 \
-#   --out-dir ~/aipc/models/lgbm_v2_groupaware_rank \
+#   --v1-model-dir ~/aipc/models/lgbm_v1_oof \
+#   --out-dir ~/aipc/models/lgbm_v2_rank \
 #   --mode rank \
 #   --rank-objective lambdarank \
 #   --label-gain 0,1,4 \
@@ -38,6 +39,11 @@ from train_lightGBM_v2 import (  # reuse the current v2 feature contract
     load_v1_feature_columns,
     resolve_v2_feature_columns,
     split_files_by_instrument,
+)
+from fdr_training_metric import (
+    FdrEvalMetadata,
+    UniquePeptideFdrEarlyStopping,
+    resolve_best_iteration,
 )
 
 
@@ -278,6 +284,22 @@ def read_selected_file_rows(
         data_frame = data_frame.with_columns([instrument_to_id_expr()])
 
     data_frame = data_frame.join(selected_info, on="group_key", how="left")
+
+    id_cast_map = {
+        "file_id": pl.Utf8,
+        "scan_number": pl.Int64,
+        "group_key": pl.Utf8,
+        "peptide_key": pl.Utf8,
+        "precursor_sequence": pl.Utf8,
+    }
+    cast_id_exprs = [
+        pl.col(col_name).cast(dtype)
+        for col_name, dtype in id_cast_map.items()
+        if col_name in data_frame.columns
+    ]
+    if cast_id_exprs:
+        data_frame = data_frame.with_columns(cast_id_exprs)
+
     data_frame = data_frame.with_columns([
         pl.col("label").cast(pl.Int8),
         pl.col("is_hard_group").fill_null(0).cast(pl.Int8),
@@ -457,7 +479,12 @@ def to_pandas_features(df: pl.DataFrame, feature_cols: List[str]):
     return features
 
 
-def fdr_metric(df: pl.DataFrame, pred: np.ndarray, fdr_threshold: float = 0.01) -> Dict:
+def fdr_metric(
+    df: pl.DataFrame,
+    pred: np.ndarray,
+    fdr_threshold: float = 0.01,
+    conservative_tdc: bool = True,
+) -> Dict:
     metric_df = df.select([
         col for col in ["label", "peptide_key", "instrument", "group_key"]
         if col in df.columns
@@ -469,7 +496,8 @@ def fdr_metric(df: pl.DataFrame, pred: np.ndarray, fdr_threshold: float = 0.01) 
     is_decoy = labels == 0
     cum_target = np.cumsum(is_target)
     cum_decoy = np.cumsum(is_decoy)
-    fdr = np.maximum(cum_decoy, 1) / np.maximum(cum_target, 1)
+    decoy_for_fdr = np.maximum(cum_decoy, 1) if conservative_tdc else cum_decoy
+    fdr = decoy_for_fdr / np.maximum(cum_target, 1)
     q_value = np.minimum.accumulate(fdr[::-1])[::-1]
     accepted = metric_df.with_columns([
         pl.Series("q_value", q_value).cast(pl.Float32),
@@ -482,6 +510,7 @@ def fdr_metric(df: pl.DataFrame, pred: np.ndarray, fdr_threshold: float = 0.01) 
         "decoy_rows": int(is_decoy.sum()),
         "accepted_target_psm_at_1pct": int(accepted.height),
         "accepted_unique_peptide_at_1pct": int(accepted["peptide_key"].n_unique()) if "peptide_key" in accepted.columns and accepted.height else 0,
+        "conservative_tdc": bool(conservative_tdc),
     }
 
     if "group_key" in metric_df.columns:
@@ -535,7 +564,7 @@ def train_model(args, feature_cols, train_df, valid_df, train_groups, valid_grou
         )
         params = {
             "objective": "binary",
-            "metric": ["auc", "binary_logloss"],
+            "metric": "None",
             "boosting_type": "gbdt",
             "learning_rate": args.learning_rate,
             "num_leaves": args.num_leaves,
@@ -580,7 +609,7 @@ def train_model(args, feature_cols, train_df, valid_df, train_groups, valid_grou
         )
         params = {
             "objective": args.rank_objective,
-            "metric": "ndcg",
+            "metric": "None",
             "eval_at": parse_eval_at(args.eval_at),
             "label_gain": label_gain,
             "boosting_type": "gbdt",
@@ -600,19 +629,29 @@ def train_model(args, feature_cols, train_df, valid_df, train_groups, valid_grou
             "num_threads": args.num_threads,
         }
 
+    fdr_stopper = UniquePeptideFdrEarlyStopping(
+        valid_features=valid_features,
+        valid_meta=FdrEvalMetadata.from_frame(
+            valid_df,
+            fdr_threshold=args.fdr_threshold,
+            conservative_tdc=not args.non_conservative_zero_decoy,
+        ),
+        stopping_rounds=args.early_stopping_rounds,
+        eval_period=args.fdr_eval_period,
+        min_delta=args.fdr_min_delta,
+    )
+
     model = lgb.train(
         params=params,
         train_set=train_set,
         num_boost_round=args.num_boost_round,
-        valid_sets=[train_set, valid_set],
-        valid_names=["train", "valid"],
-        callbacks=[
-            lgb.early_stopping(args.early_stopping_rounds),
-            lgb.log_evaluation(period=50),
-        ],
+        valid_sets=[valid_set],
+        valid_names=["valid"],
+        callbacks=[fdr_stopper],
     )
-    valid_pred = model.predict(valid_features, num_iteration=model.best_iteration)
-    return model, params, valid_pred
+    best_iteration = resolve_best_iteration(model, fdr_stopper, args.num_boost_round)
+    valid_pred = model.predict(valid_features, num_iteration=best_iteration)
+    return model, params, valid_pred, fdr_stopper, best_iteration
 
 
 def safe_classification_metrics(valid_df: pl.DataFrame, pred: np.ndarray) -> Dict:
@@ -635,7 +674,7 @@ def safe_classification_metrics(valid_df: pl.DataFrame, pred: np.ndarray) -> Dic
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", type=str, default="/root/autodl-tmp/datasets/aipc")
-    parser.add_argument("--v1-model-dir", type=str, default="~/aipc/models/lgbm_v1")
+    parser.add_argument("--v1-model-dir", type=str, default="~/aipc/models/lgbm_v1_oof")
     parser.add_argument("--out-dir", type=str, default="~/aipc/models/lgbm_v2_groupaware")
     parser.add_argument("--mode", choices=["binary", "rank"], default="binary")
     parser.add_argument("--rank-objective", choices=["lambdarank", "rank_xendcg"], default="lambdarank")
@@ -648,6 +687,14 @@ def main():
     parser.add_argument("--seed", type=int, default=20260519)
     parser.add_argument("--num-boost-round", type=int, default=3000)
     parser.add_argument("--early-stopping-rounds", type=int, default=150)
+    parser.add_argument("--fdr-threshold", type=float, default=0.01)
+    parser.add_argument("--fdr-eval-period", type=int, default=50)
+    parser.add_argument("--fdr-min-delta", type=float, default=0.0)
+    parser.add_argument(
+        "--non-conservative-zero-decoy",
+        action="store_true",
+        help="使用 cum_decoy/cum_target；默认使用 max(cum_decoy, 1)/cum_target，更贴近官方工具。",
+    )
     parser.add_argument("--num-threads", type=int, default=max(1, os.cpu_count() or 1))
 
     parser.add_argument("--hard-group-frac", type=float, default=0.45)
@@ -728,7 +775,7 @@ def main():
     with open(out_dir / "sampling_summary.json", "w", encoding="utf-8") as summary_file:
         json.dump(sampling_summary, summary_file, indent=2, ensure_ascii=False)
 
-    model, params, valid_pred = train_model(
+    model, params, valid_pred, fdr_stopper, best_iteration = train_model(
         args=args,
         feature_cols=feature_cols,
         train_df=train_df,
@@ -741,22 +788,36 @@ def main():
         json.dump(params, params_file, indent=2, ensure_ascii=False)
 
     model_path = out_dir / "model.txt"
-    model.save_model(str(model_path))
+    model.save_model(str(model_path), num_iteration=best_iteration)
 
     metrics = {
         "mode": args.mode,
-        "best_iteration": int(model.best_iteration),
+        "best_iteration": int(best_iteration),
+        "early_stopping_metric": fdr_stopper.metric_name,
+        "early_stopping_best_score": int(fdr_stopper.best_score) if np.isfinite(fdr_stopper.best_score) else None,
+        "early_stopping_best_metric": fdr_stopper.best_metric,
+        "fdr_threshold": float(args.fdr_threshold),
+        "fdr_eval_period": int(args.fdr_eval_period),
+        "fdr_conservative_tdc": bool(not args.non_conservative_zero_decoy),
         "train_rows": int(train_df.height),
         "valid_rows": int(valid_df.height),
         "train_groups": int(len(train_groups)),
         "valid_groups": int(len(valid_groups)),
         "classification_metrics_on_binary_label": safe_classification_metrics(valid_df, valid_pred),
-        "official_like_sampled_fdr": fdr_metric(valid_df, valid_pred, fdr_threshold=0.01),
+        "official_like_sampled_fdr": fdr_metric(
+            valid_df,
+            valid_pred,
+            fdr_threshold=args.fdr_threshold,
+            conservative_tdc=not args.non_conservative_zero_decoy,
+        ),
         "primary_tuning_objective": "official_like_sampled_fdr.accepted_unique_peptide_at_1pct",
     }
 
     with open(out_dir / "metrics.json", "w", encoding="utf-8") as metrics_file:
         json.dump(metrics, metrics_file, indent=2, ensure_ascii=False)
+
+    with open(out_dir / "fdr_training_history.json", "w", encoding="utf-8") as history_file:
+        json.dump(fdr_stopper.history, history_file, indent=2, ensure_ascii=False)
 
     importance = pd.DataFrame({
         "feature": feature_cols,

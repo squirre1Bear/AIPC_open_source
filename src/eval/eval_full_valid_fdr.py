@@ -51,6 +51,12 @@ CATEGORICAL_FEATURES = {
     "parse_ok",
     "fragment_parse_ok",
     "best_isotope_offset",
+    "is_first_candidate_in_scan",
+    "is_top3_candidate_in_scan",
+    "is_best_abs_delta_rt_in_scan",
+    "candidate_order_matches_abs_delta_rank",
+    "scan_has_multiple_charges",
+    "is_first_candidate_for_charge_in_scan",
     "is_lgbm_v1_group_top1",
     "is_lgbm_v1_group_top3",
 }

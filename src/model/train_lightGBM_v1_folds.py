@@ -39,6 +39,11 @@ from train_lightGBM_v1 import (
     sample_one_file,
     check_file_ready,
 )
+from fdr_training_metric import (
+    FdrEvalMetadata,
+    UniquePeptideFdrEarlyStopping,
+    resolve_best_iteration,
+)
 
 
 INSTRUMENTS = ["mzml", "tims", "wiff"]
@@ -413,7 +418,7 @@ def value_counts_dict(df: pl.DataFrame, col: str) -> Dict[str, int]:
 def params_from_args(args, fold_seed: int) -> Dict:
     return {
         "objective": "binary",
-        "metric": ["auc", "binary_logloss"],
+        "metric": "None",
         "boosting_type": "gbdt",
 
         "learning_rate": args.learning_rate,
@@ -591,23 +596,33 @@ def train_one_fold(
     print()
     print("========== 开始训练 LightGBM v1 fold ==========")
 
+    fdr_stopper = UniquePeptideFdrEarlyStopping(
+        valid_features=X_valid,
+        valid_meta=FdrEvalMetadata.from_frame(
+            valid_df,
+            fdr_threshold=args.fdr_threshold,
+            conservative_tdc=not args.non_conservative_zero_decoy,
+        ),
+        stopping_rounds=args.early_stopping_rounds,
+        eval_period=args.fdr_eval_period,
+        min_delta=args.fdr_min_delta,
+    )
+
     model = lgb.train(
         params=params,
         train_set=lgb_train,
         num_boost_round=args.num_boost_round,
-        valid_sets=[lgb_train, lgb_valid],
-        valid_names=["train", "valid"],
-        callbacks=[
-            lgb.early_stopping(args.early_stopping_rounds),
-            lgb.log_evaluation(period=50),
-        ],
+        valid_sets=[lgb_valid],
+        valid_names=["valid"],
+        callbacks=[fdr_stopper],
     )
 
-    model.save_model(str(model_path))
+    best_iteration = resolve_best_iteration(model, fdr_stopper, args.num_boost_round)
+    model.save_model(str(model_path), num_iteration=best_iteration)
 
     print()
     print(f"fold_{fold_id} 模型已保存: {model_path}")
-    print("best_iteration:", model.best_iteration)
+    print("best_iteration:", best_iteration)
 
     # --------------------------------------------------------
     # 验证
@@ -617,17 +632,27 @@ def train_one_fold(
 
     valid_pred = model.predict(
         X_valid,
-        num_iteration=model.best_iteration,
+        num_iteration=best_iteration,
     )
 
     basic_metrics = compute_basic_metrics(y_valid, valid_pred)
-    sampled_fdr_metrics = compute_sampled_fdr_metric(valid_df, valid_pred)
+    sampled_fdr_metrics = compute_sampled_fdr_metric(
+        valid_df,
+        valid_pred,
+        conservative_tdc=not args.non_conservative_zero_decoy,
+    )
 
     metrics = {
         "fold": int(fold_id),
         "basic_metrics": basic_metrics,
         "sampled_fdr_metrics": sampled_fdr_metrics,
-        "best_iteration": int(model.best_iteration),
+        "best_iteration": int(best_iteration),
+        "early_stopping_metric": fdr_stopper.metric_name,
+        "early_stopping_best_score": int(fdr_stopper.best_score) if np.isfinite(fdr_stopper.best_score) else None,
+        "early_stopping_best_metric": fdr_stopper.best_metric,
+        "fdr_threshold": float(args.fdr_threshold),
+        "fdr_eval_period": int(args.fdr_eval_period),
+        "fdr_conservative_tdc": bool(not args.non_conservative_zero_decoy),
         "train_rows": int(len(y_train)),
         "valid_rows": int(len(y_valid)),
         "positive_rate_train": float(np.mean(y_train)),
@@ -643,6 +668,9 @@ def train_one_fold(
 
     with open(fold_dir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2, ensure_ascii=False)
+
+    with open(fold_dir / "fdr_training_history.json", "w", encoding="utf-8") as f:
+        json.dump(fdr_stopper.history, f, indent=2, ensure_ascii=False)
 
     # --------------------------------------------------------
     # 特征重要性
@@ -785,6 +813,33 @@ def main():
         "--early-stopping-rounds",
         type=int,
         default=150,
+    )
+
+    parser.add_argument(
+        "--fdr-threshold",
+        type=float,
+        default=0.01,
+        help="早停主指标使用的 FDR 阈值。比赛主目标固定为 0.01。",
+    )
+
+    parser.add_argument(
+        "--fdr-eval-period",
+        type=int,
+        default=50,
+        help="每多少轮计算一次 unique peptide @ FDR；全量排序较慢，不建议设为 1。",
+    )
+
+    parser.add_argument(
+        "--fdr-min-delta",
+        type=float,
+        default=0.0,
+        help="unique peptide @ FDR 至少提升多少才算早停改进。",
+    )
+
+    parser.add_argument(
+        "--non-conservative-zero-decoy",
+        action="store_true",
+        help="使用 cum_decoy/cum_target；默认使用 max(cum_decoy, 1)/cum_target，更贴近官方工具。",
     )
 
     parser.add_argument(

@@ -2,7 +2,9 @@
 
 # python src/preprocess/add_group_feature_test.py \
 #   --parquet-dir /root/autodl-tmp/datasets/aipc/processed/bas_merged \
-#   --model-dir ~/aipc/models/lgbm_v1
+#   --fold-model-dir ~/aipc/models/lgbm_v1_oof \
+#   --workers=12
+#   --force
 
 from pathlib import Path
 import argparse
@@ -84,6 +86,67 @@ def load_model_and_features(model_dir: Path):
     return model, feature_cols
 
 
+def load_models_and_features(model_dirs):
+    model_dirs = [Path(p).expanduser() for p in model_dirs]
+    if not model_dirs:
+        raise ValueError("model_dirs 不能为空")
+
+    models = []
+    feature_cols = None
+
+    for model_dir in model_dirs:
+        model, current_feature_cols = load_model_and_features(model_dir)
+
+        if feature_cols is None:
+            feature_cols = current_feature_cols
+        elif current_feature_cols != feature_cols:
+            raise RuntimeError(
+                "fold 模型 feature_columns.json 不一致："
+                f"base={model_dirs[0]}, current={model_dir}"
+            )
+
+        models.append(model)
+
+    return models, feature_cols
+
+
+def fold_model_dirs_from_root(fold_model_dir: Path):
+    fold_model_dir = fold_model_dir.expanduser()
+    manifest_path = fold_model_dir / "folds.json"
+
+    if manifest_path.exists():
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        n_folds = int(manifest["n_folds"])
+        model_dirs = [fold_model_dir / f"fold_{fold_id}" for fold_id in range(n_folds)]
+    else:
+        model_dirs = sorted(
+            [p for p in fold_model_dir.glob("fold_*") if p.is_dir()],
+            key=lambda p: (
+                0,
+                int(p.name.split("_")[-1]),
+            ) if p.name.split("_")[-1].isdigit() else (1, p.name),
+        )
+
+    if not model_dirs:
+        raise FileNotFoundError(f"未找到 fold 模型目录: {fold_model_dir}/fold_*")
+
+    missing = []
+    for model_dir in model_dirs:
+        if not (model_dir / "model.txt").exists():
+            missing.append(str(model_dir / "model.txt"))
+        if not (model_dir / "feature_columns.json").exists():
+            missing.append(str(model_dir / "feature_columns.json"))
+
+    if missing:
+        raise FileNotFoundError(
+            "fold 模型不完整，无法进行 test 5-fold ensemble。缺少："
+            + "; ".join(missing[:20])
+        )
+
+    return model_dirs
+
+
 def prepare_feature_df(path: Path, feature_cols):
     schema = set(pl.scan_parquet(path).collect_schema().names())
 
@@ -121,6 +184,12 @@ def prepare_feature_df(path: Path, feature_cols):
         "parse_ok",
         "fragment_parse_ok",
         "best_isotope_offset",
+        "is_first_candidate_in_scan",
+        "is_top3_candidate_in_scan",
+        "is_best_abs_delta_rt_in_scan",
+        "candidate_order_matches_abs_delta_rank",
+        "scan_has_multiple_charges",
+        "is_first_candidate_for_charge_in_scan",
     }
 
     for c in feature_cols:
@@ -144,6 +213,23 @@ def predict(model, df: pl.DataFrame, feature_cols):
         pred = model.predict(X)
 
     return np.asarray(pred, dtype=np.float32)
+
+
+def predict_ensemble(models, df: pl.DataFrame, feature_cols):
+    X = df.select(feature_cols).to_pandas()
+    X = X.replace([np.inf, -np.inf], np.nan)
+
+    pred_sum = np.zeros(df.height, dtype=np.float64)
+
+    for model in models:
+        best_iter = getattr(model, "best_iteration", None)
+        if best_iter is not None and best_iter > 0:
+            pred = model.predict(X, num_iteration=best_iter)
+        else:
+            pred = model.predict(X)
+        pred_sum += np.asarray(pred, dtype=np.float64)
+
+    return (pred_sum / max(1, len(models))).astype(np.float32)
 
 
 def build_group_features(feature_df: pl.DataFrame, pred):
@@ -242,16 +328,21 @@ def build_group_features(feature_df: pl.DataFrame, pred):
     return score_df.select(["__row_id"] + GROUP_FEATURE_COLS)
 
 
-def process_one_file(path: Path, model_dir: Path, force: bool):
+def process_one_file(path: Path, model_dirs, force: bool):
     schema = set(pl.scan_parquet(path).collect_schema().names())
     if "group_feature_done" in schema and not force:
         print(f"已处理，跳过: {path}")
         return
 
-    model, feature_cols = load_model_and_features(model_dir)
+    models, feature_cols = load_models_and_features(model_dirs)
+
+    if len(model_dirs) == 1:
+        print(f"v1 score model: {model_dirs[0]}")
+    else:
+        print(f"v1 score fold ensemble: {len(model_dirs)} models")
 
     feature_df = prepare_feature_df(path, feature_cols)
-    pred = predict(model, feature_df, feature_cols)
+    pred = predict_ensemble(models, feature_df, feature_cols)
     group_df = build_group_features(feature_df, pred)
 
     df = pl.read_parquet(path)
@@ -278,18 +369,39 @@ def process_one_file(path: Path, model_dir: Path, force: bool):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--parquet-dir", type=str, default="/root/autodl-tmp/datasets/aipc/test_processed/bas_merged")
-    parser.add_argument("--model-dir", type=str, default="/root/autodl-tmp/datasets/aipc/models/lgbm_table_v1")
+    parser.add_argument(
+        "--fold-model-dir",
+        type=str,
+        default="",
+        help="OOF v1 fold 总目录。提供后，测试集使用 fold_0..fold_N 平均打分。",
+    )
+    parser.add_argument(
+        "--model-dir",
+        type=str,
+        default="/root/autodl-tmp/datasets/aipc/models/lgbm_table_v1",
+        help="兼容旧流程：单个 full v1 模型目录。未提供 --fold-model-dir 时使用。",
+    )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
     d = Path(args.parquet_dir)
-    model_dir = Path(args.model_dir)
+
+    if args.fold_model_dir:
+        model_dirs = fold_model_dirs_from_root(Path(args.fold_model_dir))
+        print("score mode: fold ensemble")
+    else:
+        model_dirs = [Path(args.model_dir).expanduser()]
+        print("score mode: single model")
+
+    print("model dirs:")
+    for model_dir in model_dirs:
+        print("  ", model_dir)
 
     files = sorted(d.glob("*.parquet"))
     print("files:", len(files))
 
     for path in tqdm(files):
-        process_one_file(path, model_dir, force=args.force)
+        process_one_file(path, model_dirs, force=args.force)
         gc.collect()
 
 

@@ -19,6 +19,12 @@ import polars as pl
 import lightgbm as lgb
 from tqdm import tqdm
 
+from fdr_training_metric import (
+    FdrEvalMetadata,
+    UniquePeptideFdrEarlyStopping,
+    resolve_best_iteration,
+)
+
 
 INSTRUMENTS = ["mzml", "tims", "wiff"]
 
@@ -30,6 +36,12 @@ CATEGORICAL_FEATURES = {
     "parse_ok",
     "fragment_parse_ok",
     "best_isotope_offset",
+    "is_first_candidate_in_scan",
+    "is_top3_candidate_in_scan",
+    "is_best_abs_delta_rt_in_scan",
+    "candidate_order_matches_abs_delta_rank",
+    "scan_has_multiple_charges",
+    "is_first_candidate_for_charge_in_scan",
     "is_lgbm_v1_group_top1",
     "is_lgbm_v1_group_top3",
 }
@@ -417,7 +429,7 @@ def polars_to_lgb_xy(df: pl.DataFrame, feature_cols: List[str]):
     return X, y
 
 
-def compute_sampled_fdr(valid_df: pl.DataFrame, pred: np.ndarray) -> Dict:
+def compute_sampled_fdr(valid_df: pl.DataFrame, pred: np.ndarray, conservative_tdc: bool = True) -> Dict:
     df = valid_df.select([
         "label",
         "instrument",
@@ -437,7 +449,8 @@ def compute_sampled_fdr(valid_df: pl.DataFrame, pred: np.ndarray) -> Dict:
     cum_target = np.cumsum(is_target)
     cum_decoy = np.cumsum(is_decoy)
 
-    fdr = cum_decoy / np.maximum(cum_target, 1)
+    decoy_for_fdr = np.maximum(cum_decoy, 1) if conservative_tdc else cum_decoy
+    fdr = decoy_for_fdr / np.maximum(cum_target, 1)
     q = np.minimum.accumulate(fdr[::-1])[::-1]
 
     keep = q <= 0.01
@@ -463,6 +476,7 @@ def compute_sampled_fdr(valid_df: pl.DataFrame, pred: np.ndarray) -> Dict:
         "top1_target_rate": float(top1["label"].mean()) if top1.height > 0 else None,
         "accepted_target_psm_at_1pct": int(accepted.height),
         "accepted_unique_peptide_at_1pct": int(accepted["peptide_key"].n_unique()) if accepted.height > 0 else 0,
+        "conservative_tdc": bool(conservative_tdc),
         "by_instrument": {},
     }
 
@@ -507,6 +521,14 @@ def main():
     parser.add_argument("--seed", type=int, default=20260519)
     parser.add_argument("--num-boost-round", type=int, default=3000)
     parser.add_argument("--early-stopping-rounds", type=int, default=150)
+    parser.add_argument("--fdr-threshold", type=float, default=0.01)
+    parser.add_argument("--fdr-eval-period", type=int, default=50)
+    parser.add_argument("--fdr-min-delta", type=float, default=0.0)
+    parser.add_argument(
+        "--non-conservative-zero-decoy",
+        action="store_true",
+        help="使用 cum_decoy/cum_target；默认使用 max(cum_decoy, 1)/cum_target，更贴近官方工具。",
+    )
 
     args = parser.parse_args()
 
@@ -600,7 +622,7 @@ def main():
 
     params = {
         "objective": "lambdarank",
-        "metric": "ndcg",
+        "metric": "None",
         "eval_at": [1, 3, 5],
 
         "label_gain": [0, 1, 2],
@@ -630,35 +652,55 @@ def main():
 
     print("\n========== 开始训练 LightGBM LambdaRank ==========")
 
+    fdr_stopper = UniquePeptideFdrEarlyStopping(
+        valid_features=X_valid,
+        valid_meta=FdrEvalMetadata.from_frame(
+            valid_df,
+            fdr_threshold=args.fdr_threshold,
+            conservative_tdc=not args.non_conservative_zero_decoy,
+        ),
+        stopping_rounds=args.early_stopping_rounds,
+        eval_period=args.fdr_eval_period,
+        min_delta=args.fdr_min_delta,
+    )
+
     model = lgb.train(
         params=params,
         train_set=lgb_train,
         num_boost_round=args.num_boost_round,
-        valid_sets=[lgb_train, lgb_valid],
-        valid_names=["train", "valid"],
-        callbacks=[
-            lgb.early_stopping(args.early_stopping_rounds),
-            lgb.log_evaluation(period=50),
-        ],
+        valid_sets=[lgb_valid],
+        valid_names=["valid"],
+        callbacks=[fdr_stopper],
     )
 
     model_path = out_dir / "model.txt"
-    model.save_model(str(model_path))
+    best_iteration = resolve_best_iteration(model, fdr_stopper, args.num_boost_round)
+    model.save_model(str(model_path), num_iteration=best_iteration)
 
     print("模型已保存:", model_path)
-    print("best_iteration:", model.best_iteration)
+    print("best_iteration:", best_iteration)
 
     print("\n========== 采样验证集评估 ==========")
 
     valid_pred = model.predict(
         X_valid,
-        num_iteration=model.best_iteration,
+        num_iteration=best_iteration,
     )
 
-    sampled_metric = compute_sampled_fdr(valid_df, valid_pred)
+    sampled_metric = compute_sampled_fdr(
+        valid_df,
+        valid_pred,
+        conservative_tdc=not args.non_conservative_zero_decoy,
+    )
 
     metrics = {
-        "best_iteration": int(model.best_iteration),
+        "best_iteration": int(best_iteration),
+        "early_stopping_metric": fdr_stopper.metric_name,
+        "early_stopping_best_score": int(fdr_stopper.best_score) if np.isfinite(fdr_stopper.best_score) else None,
+        "early_stopping_best_metric": fdr_stopper.best_metric,
+        "fdr_threshold": float(args.fdr_threshold),
+        "fdr_eval_period": int(args.fdr_eval_period),
+        "fdr_conservative_tdc": bool(not args.non_conservative_zero_decoy),
         "train_rows": int(len(y_train)),
         "valid_rows": int(len(y_valid)),
         "train_groups": int(len(train_groups)),
@@ -670,6 +712,9 @@ def main():
 
     with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2, ensure_ascii=False)
+
+    with open(out_dir / "fdr_training_history.json", "w", encoding="utf-8") as f:
+        json.dump(fdr_stopper.history, f, indent=2, ensure_ascii=False)
 
     imp_gain = model.feature_importance(importance_type="gain")
     imp_split = model.feature_importance(importance_type="split")
