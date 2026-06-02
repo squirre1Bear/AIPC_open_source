@@ -30,6 +30,34 @@ logging.basicConfig(
 )
 
 
+INSTRUMENTS = ["mzml", "tims", "wiff"]
+RT_QVALUE_ANOMALY_INSTRUMENTS = {"tims", "wiff"}
+RT_QVALUE_ANOMALY_FEATURES = [
+    "predicted_rt",
+    "delta_rt",
+    "spectrum_q",
+    "spectrum_q_filled",
+    "abs_delta_rt",
+    "delta_rt_z_in_file",
+    "predicted_rt_z_in_file",
+    "abs_delta_rt_rank_in_scan",
+    "abs_delta_rt_rank_pct_in_scan",
+    "is_best_abs_delta_rt_in_scan",
+    "abs_delta_rt_min_in_scan",
+    "abs_delta_rt_mean_in_scan",
+    "abs_delta_rt_std_in_scan",
+    "abs_delta_rt_gap_to_best_in_scan",
+    "abs_delta_rt_z_in_scan",
+    "candidate_order_rt_rank_gap",
+    "abs_candidate_order_rt_rank_gap",
+    "candidate_order_matches_abs_delta_rank",
+]
+RT_QVALUE_ANOMALY_CATEGORICAL_FEATURES = {
+    "is_best_abs_delta_rt_in_scan",
+    "candidate_order_matches_abs_delta_rank",
+}
+
+
 def mkdir_p(dirs: str):
     """
     保持官方脚本风格：
@@ -80,6 +108,100 @@ def load_lgbm_model_and_features(model_path: str):
     return model, feature_cols
 
 
+def discover_instrument_model_paths(model_root: str) -> dict[str, Path] | None:
+    """
+    If model_root contains mzml/tims/wiff subdirectories, treat it as a
+    per-instrument model root. Otherwise return None and use single-model mode.
+    """
+    root = Path(model_root).expanduser().resolve()
+    if not root.is_dir():
+        return None
+
+    model_paths = {}
+    for instrument in INSTRUMENTS:
+        candidate = root / instrument
+        if (candidate / "model.txt").exists() and (candidate / "feature_columns.json").exists():
+            model_paths[instrument] = candidate
+
+    if not model_paths:
+        return None
+
+
+    missing = sorted(set(INSTRUMENTS) - set(model_paths))
+    if missing:
+        raise FileNotFoundError(
+            f"检测到按仪器模型根目录，但缺少这些子模型: {missing}; root={root}"
+        )
+    return model_paths
+
+
+def load_model_bundle(model_path: str):
+    instrument_paths = discover_instrument_model_paths(model_path)
+    if instrument_paths is None:
+        model, feature_cols = load_lgbm_model_and_features(model_path)
+        return {"__single__": (model, feature_cols)}
+
+    bundle = {}
+    for instrument, path in instrument_paths.items():
+        logger.info(f"Loading {instrument} model from: {path}")
+        bundle[instrument] = load_lgbm_model_and_features(str(path))
+    return bundle
+
+
+def select_model_for_file(model_bundle, file_path: Path):
+    if "__single__" in model_bundle:
+        return model_bundle["__single__"]
+
+    instrument = infer_instrument_from_filename(file_path.name)
+    if instrument not in model_bundle:
+        raise RuntimeError(f"无法为 {file_path.name} 选择仪器模型: instrument={instrument}")
+    return model_bundle[instrument]
+
+
+def mask_rt_qvalue_anomaly_features(
+    features: pd.DataFrame,
+    source_df: pl.DataFrame,
+    feature_cols: list[str],
+    context: str,
+) -> pd.DataFrame:
+    if "instrument" not in source_df.columns:
+        logger.warning(f"skip RT/q-value anomaly masking for {context}: missing instrument column")
+        return features
+
+    columns_to_mask = [
+        col for col in RT_QVALUE_ANOMALY_FEATURES
+        if col in feature_cols and col in features.columns
+    ]
+    if not columns_to_mask:
+        return features
+
+    instruments = source_df["instrument"].cast(pl.Utf8).to_numpy()
+    row_mask = np.isin(instruments, list(RT_QVALUE_ANOMALY_INSTRUMENTS))
+    masked_rows = int(row_mask.sum())
+    if masked_rows == 0:
+        return features
+
+    features = features.copy()
+    categorical_to_mask = [
+        col for col in columns_to_mask
+        if col in RT_QVALUE_ANOMALY_CATEGORICAL_FEATURES
+    ]
+    numeric_to_mask = [
+        col for col in columns_to_mask
+        if col not in RT_QVALUE_ANOMALY_CATEGORICAL_FEATURES
+    ]
+    if numeric_to_mask:
+        features.loc[row_mask, numeric_to_mask] = np.nan
+    if categorical_to_mask:
+        features.loc[row_mask, categorical_to_mask] = -1
+
+    logger.info(
+        f"{context}: masked {len(columns_to_mask)} RT/q-value anomaly features "
+        f"for {masked_rows:,} tims/wiff rows"
+    )
+    return features
+
+
 def instrument_to_id_expr():
     """
     与训练脚本保持一致：
@@ -109,13 +231,14 @@ def infer_instrument_from_filename(file_name: str) -> str:
       tims_bas_b_0.parquet
       wiff_bas_a_4.parquet
     """
-    name = file_name.lower()
+    name = file_name.lower().replace("-", "_")
+    tokens = name.split("_")
 
-    if name.startswith("mzml"):
+    if name.startswith("mzml") or "mzml" in tokens:
         return "mzml"
-    if name.startswith("tims"):
+    if name.startswith("tims") or "tims" in tokens:
         return "tims"
-    if name.startswith("wiff"):
+    if name.startswith("wiff") or "wiff" in tokens:
         return "wiff"
 
     return "unknown"
@@ -246,13 +369,18 @@ def prepare_feature_df(df: pl.DataFrame, feature_cols: list[str], file_name: str
 
     X = df_feat.to_pandas()
     X = X.replace([np.inf, -np.inf], np.nan)
+    X = mask_rt_qvalue_anomaly_features(
+        X,
+        df,
+        feature_cols,
+        context=f"predict {file_name}",
+    )
 
     return X
 
 
 def predict_one_file(
-    model: lgb.Booster,
-    feature_cols: list[str],
+    model_bundle,
     file_path: str,
     out_path: str,
 ):
@@ -283,6 +411,7 @@ def predict_one_file(
 
     index = df["index"].to_numpy()
 
+    model, feature_cols = select_model_for_file(model_bundle, file_path)
     X = prepare_feature_df(df, feature_cols, file_path.name)
 
     best_iter = getattr(model, "best_iteration", None)
@@ -425,7 +554,7 @@ def main():
     logger.info(f"inference use model path: {args.model_path}")
     logger.info(f"parquet_dir: {args.parquet_dir}")
 
-    model, feature_cols = load_lgbm_model_and_features(args.model_path)
+    model_bundle = load_model_bundle(args.model_path)
 
     if args.out_path == "":
         out_path = args.parquet_dir
@@ -451,8 +580,7 @@ def main():
     for file_path in tqdm(data_path_list):
         try:
             predict_one_file(
-                model=model,
-                feature_cols=feature_cols,
+                model_bundle=model_bundle,
                 file_path=str(file_path),
                 out_path=out_path,
             )
