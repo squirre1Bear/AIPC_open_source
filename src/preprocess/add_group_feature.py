@@ -28,6 +28,31 @@ DEFAULT_DATA_ROOT = "/root/autodl-tmp/datasets/aipc"
 DEFAULT_MODEL_DIR = "/root/autodl-tmp/datasets/aipc/models/lgbm_table_v1"
 
 INSTRUMENTS = ["mzml", "tims", "wiff"]
+RT_QVALUE_ANOMALY_INSTRUMENT_IDS = {1, 2}
+RT_QVALUE_ANOMALY_FEATURES = [
+    "predicted_rt",
+    "delta_rt",
+    "spectrum_q",
+    "spectrum_q_filled",
+    "abs_delta_rt",
+    "delta_rt_z_in_file",
+    "predicted_rt_z_in_file",
+    "abs_delta_rt_rank_in_scan",
+    "abs_delta_rt_rank_pct_in_scan",
+    "is_best_abs_delta_rt_in_scan",
+    "abs_delta_rt_min_in_scan",
+    "abs_delta_rt_mean_in_scan",
+    "abs_delta_rt_std_in_scan",
+    "abs_delta_rt_gap_to_best_in_scan",
+    "abs_delta_rt_z_in_scan",
+    "candidate_order_rt_rank_gap",
+    "abs_candidate_order_rt_rank_gap",
+    "candidate_order_matches_abs_delta_rank",
+]
+RT_QVALUE_ANOMALY_CATEGORICAL_FEATURES = {
+    "is_best_abs_delta_rt_in_scan",
+    "candidate_order_matches_abs_delta_rank",
+}
 
 TMP_SUFFIX = ".tmp_group.parquet"
 
@@ -200,6 +225,45 @@ def load_lgbm_models_and_feature_columns(model_dirs):
         models.append(load_lgbm_model(model_dir))
 
     return models, feature_cols
+
+
+def mask_rt_qvalue_anomaly_features(feature_df: pl.DataFrame, feature_cols):
+    columns_to_mask = [
+        col for col in RT_QVALUE_ANOMALY_FEATURES
+        if col in feature_cols and col in feature_df.columns
+    ]
+    if not columns_to_mask or "instrument_id" not in feature_df.columns:
+        return feature_df
+
+    numeric_to_mask = [
+        col for col in columns_to_mask
+        if col not in RT_QVALUE_ANOMALY_CATEGORICAL_FEATURES
+    ]
+    categorical_to_mask = [
+        col for col in columns_to_mask
+        if col in RT_QVALUE_ANOMALY_CATEGORICAL_FEATURES
+    ]
+    anomaly_expr = pl.col("instrument_id").is_in(list(RT_QVALUE_ANOMALY_INSTRUMENT_IDS))
+    exprs = []
+    exprs.extend(
+        pl.when(anomaly_expr)
+        .then(pl.lit(None, dtype=pl.Float32))
+        .otherwise(pl.col(col))
+        .cast(pl.Float32)
+        .alias(col)
+        for col in numeric_to_mask
+    )
+    exprs.extend(
+        pl.when(anomaly_expr)
+        .then(pl.lit(-1))
+        .otherwise(pl.col(col))
+        .cast(pl.Int16)
+        .alias(col)
+        for col in categorical_to_mask
+    )
+    if exprs:
+        feature_df = feature_df.with_columns(exprs)
+    return feature_df
 
 
 def prepare_feature_frame(path: Path, feature_cols):
@@ -466,7 +530,12 @@ def build_group_feature_df(feature_df: pl.DataFrame, pred: np.ndarray) -> pl.Dat
     return out
 
 
-def add_group_features_to_file_with_model_dirs(path: Path, model_dirs, force: bool):
+def add_group_features_to_file_with_model_dirs(
+    path: Path,
+    model_dirs,
+    force: bool,
+    mask_rt_qvalue_anomaly: bool = False,
+):
     print(f"\n开始处理: {path}")
 
     schema_cols = set(get_schema_cols(path))
@@ -486,6 +555,8 @@ def add_group_features_to_file_with_model_dirs(path: Path, model_dirs, force: bo
             print(f"  - {model_dir}")
 
     feature_df = prepare_feature_frame(path, feature_cols)
+    if mask_rt_qvalue_anomaly:
+        feature_df = mask_rt_qvalue_anomaly_features(feature_df, feature_cols)
     pred = predict_lgbm_scores_ensemble(models, feature_df, feature_cols)
 
     group_feature_df = build_group_feature_df(feature_df, pred)
@@ -558,23 +629,40 @@ def add_group_features_to_file_with_model_dirs(path: Path, model_dirs, force: bo
     print(f"列数: {col_count}")
 
 
-def add_group_features_to_file(path: Path, model_dir: Path, force: bool):
+def add_group_features_to_file(
+    path: Path,
+    model_dir: Path,
+    force: bool,
+    mask_rt_qvalue_anomaly: bool = False,
+):
     add_group_features_to_file_with_model_dirs(
         path=path,
         model_dirs=[model_dir],
         force=force,
+        mask_rt_qvalue_anomaly=mask_rt_qvalue_anomaly,
     )
 
 
-def add_group_features_to_file_ensemble(path: Path, model_dirs, force: bool):
+def add_group_features_to_file_ensemble(
+    path: Path,
+    model_dirs,
+    force: bool,
+    mask_rt_qvalue_anomaly: bool = False,
+):
     add_group_features_to_file_with_model_dirs(
         path=path,
         model_dirs=model_dirs,
         force=force,
+        mask_rt_qvalue_anomaly=mask_rt_qvalue_anomaly,
     )
 
 
-def run_one_file_subprocess(path: Path, model_dir: Path, force: bool):
+def run_one_file_subprocess(
+    path: Path,
+    model_dir: Path,
+    force: bool,
+    mask_rt_qvalue_anomaly: bool = False,
+):
     env = os.environ.copy()
     env["POLARS_MAX_THREADS"] = "1"
     env["OMP_NUM_THREADS"] = "1"
@@ -593,6 +681,8 @@ def run_one_file_subprocess(path: Path, model_dir: Path, force: bool):
 
     if force:
         cmd.append("--force")
+    if mask_rt_qvalue_anomaly:
+        cmd.append("--mask-rt-qvalue-anomaly")
 
     result = subprocess.run(cmd, env=env)
 
@@ -638,6 +728,19 @@ def main():
     )
 
     parser.add_argument(
+        "--only-instrument",
+        choices=INSTRUMENTS,
+        default=None,
+        help="Only process one instrument. Default keeps the existing all-instrument flow.",
+    )
+
+    parser.add_argument(
+        "--mask-rt-qvalue-anomaly",
+        action="store_true",
+        help="Mask tims/wiff RT/q-value anomaly features before v1 inference.",
+    )
+
+    parser.add_argument(
         "--max-files",
         type=int,
         default=None,
@@ -661,10 +764,13 @@ def main():
             path=Path(args.one_file),
             model_dir=model_dir,
             force=args.force,
+            mask_rt_qvalue_anomaly=args.mask_rt_qvalue_anomaly,
         )
         return
 
     files = list_split_files(data_root, args.splits)
+    if args.only_instrument is not None:
+        files = [p for p in files if args.only_instrument in [part.lower() for part in p.parts]]
 
     if args.max_files is not None:
         files = files[: args.max_files]
@@ -673,7 +779,9 @@ def main():
     print(f"总共需要处理 {len(files)} 个 parquet")
     print(f"model_dir: {model_dir}")
     print(f"splits: {args.splits}")
+    print(f"only_instrument: {args.only_instrument or 'all'}")
     print(f"force: {args.force}")
+    print(f"mask_rt_qvalue_anomaly: {args.mask_rt_qvalue_anomaly}")
 
     if len(files) == 0:
         print("没有文件需要处理")
@@ -689,7 +797,13 @@ def main():
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_path = {
-                executor.submit(run_one_file_subprocess, path, model_dir, args.force): path
+                executor.submit(
+                    run_one_file_subprocess,
+                    path,
+                    model_dir,
+                    args.force,
+                    args.mask_rt_qvalue_anomaly,
+                ): path
                 for path in files
             }
 
@@ -719,6 +833,7 @@ def main():
                     path=path,
                     model_dir=model_dir,
                     force=args.force,
+                    mask_rt_qvalue_anomaly=args.mask_rt_qvalue_anomaly,
                 )
                 gc.collect()
             except Exception as e:

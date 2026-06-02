@@ -26,6 +26,7 @@ if str(PREPROCESS_DIR) not in sys.path:
     sys.path.insert(0, str(PREPROCESS_DIR))
 
 from add_group_feature import (  # noqa: E402
+    INSTRUMENTS,
     TMP_SUFFIX,
     add_group_features_to_file,
     add_group_features_to_file_ensemble,
@@ -35,6 +36,18 @@ from add_group_feature import (  # noqa: E402
 
 
 MAX_PARALLEL_FILES = 12
+
+
+def infer_instrument_from_path(path: Path) -> str:
+    lower_parts = [part.lower() for part in path.parts]
+    for instrument in INSTRUMENTS:
+        if instrument in lower_parts:
+            return instrument
+    lower_name = path.name.lower()
+    for instrument in INSTRUMENTS:
+        if instrument in lower_name:
+            return instrument
+    return "unknown"
 
 
 def load_fold_manifest(fold_model_dir: Path) -> Dict:
@@ -122,6 +135,7 @@ def process_one(
     ensemble_model_dirs: List[Path],
     fold_map: Dict[str, int],
     force: bool,
+    mask_rt_qvalue_anomaly: bool,
 ) -> Tuple[str, bool, str]:
     try:
         model_dirs, source = model_dirs_for_file(
@@ -143,9 +157,19 @@ def process_one(
 
         print(f"\n[{source}] {path}")
         if len(model_dirs) == 1:
-            add_group_features_to_file(path=path, model_dir=model_dirs[0], force=force)
+            add_group_features_to_file(
+                path=path,
+                model_dir=model_dirs[0],
+                force=force,
+                mask_rt_qvalue_anomaly=mask_rt_qvalue_anomaly,
+            )
         else:
-            add_group_features_to_file_ensemble(path=path, model_dirs=model_dirs, force=force)
+            add_group_features_to_file_ensemble(
+                path=path,
+                model_dirs=model_dirs,
+                force=force,
+                mask_rt_qvalue_anomaly=mask_rt_qvalue_anomaly,
+            )
         return str(path), True, source
 
     except BaseException as e:
@@ -156,10 +180,12 @@ def process_one(
         gc.collect()
 
 
-def collect_files(data_root: Path, splits, max_files):
+def collect_files(data_root: Path, splits, max_files, only_instrument: Optional[str] = None):
     split_to_files = {}
     for split in splits:
         files = list_split_files(data_root, [split])
+        if only_instrument is not None:
+            files = [p for p in files if infer_instrument_from_path(p) == only_instrument]
         if max_files is not None:
             files = files[:max_files]
         split_to_files[split] = files
@@ -184,6 +210,17 @@ def main():
         help="train 使用对应 OOF fold 模型；valid 默认使用所有 fold 模型平均。",
     )
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--only-instrument",
+        choices=INSTRUMENTS,
+        default=None,
+        help="Only process one instrument. Default keeps the existing all-instrument flow.",
+    )
+    parser.add_argument(
+        "--mask-rt-qvalue-anomaly",
+        action="store_true",
+        help="Mask tims/wiff RT/q-value anomaly features before v1 inference.",
+    )
     parser.add_argument("--max-files", type=int, default=None)
     parser.add_argument("--workers", type=int, default=MAX_PARALLEL_FILES)
     args = parser.parse_args()
@@ -196,7 +233,12 @@ def main():
     fold_map = build_fold_map(manifest)
     ensemble_model_dirs = fold_model_dirs_from_manifest(fold_model_dir, manifest)
 
-    split_to_files = collect_files(data_root, args.splits, args.max_files)
+    split_to_files = collect_files(
+        data_root,
+        args.splits,
+        args.max_files,
+        only_instrument=args.only_instrument,
+    )
     jobs = []
     for split, files in split_to_files.items():
         for path in files:
@@ -211,7 +253,9 @@ def main():
     for model_dir in ensemble_model_dirs:
         print("  ", model_dir)
     print("splits:", args.splits)
+    print("only_instrument:", args.only_instrument or "all")
     print("force:", args.force)
+    print("mask_rt_qvalue_anomaly:", args.mask_rt_qvalue_anomaly)
     print("workers:", args.workers)
     print("files:", len(jobs))
 
@@ -234,6 +278,7 @@ def main():
                 ensemble_model_dirs,
                 fold_map,
                 args.force,
+                args.mask_rt_qvalue_anomaly,
             ): (split, path)
             for split, path in jobs
         }

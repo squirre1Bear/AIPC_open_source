@@ -19,6 +19,32 @@ from tqdm import tqdm
 
 
 TMP_SUFFIX = ".tmp_group.parquet"
+INSTRUMENTS = ["mzml", "tims", "wiff"]
+RT_QVALUE_ANOMALY_INSTRUMENT_IDS = {1, 2}
+RT_QVALUE_ANOMALY_FEATURES = [
+    "predicted_rt",
+    "delta_rt",
+    "spectrum_q",
+    "spectrum_q_filled",
+    "abs_delta_rt",
+    "delta_rt_z_in_file",
+    "predicted_rt_z_in_file",
+    "abs_delta_rt_rank_in_scan",
+    "abs_delta_rt_rank_pct_in_scan",
+    "is_best_abs_delta_rt_in_scan",
+    "abs_delta_rt_min_in_scan",
+    "abs_delta_rt_mean_in_scan",
+    "abs_delta_rt_std_in_scan",
+    "abs_delta_rt_gap_to_best_in_scan",
+    "abs_delta_rt_z_in_scan",
+    "candidate_order_rt_rank_gap",
+    "abs_candidate_order_rt_rank_gap",
+    "candidate_order_matches_abs_delta_rank",
+]
+RT_QVALUE_ANOMALY_CATEGORICAL_FEATURES = {
+    "is_best_abs_delta_rt_in_scan",
+    "candidate_order_matches_abs_delta_rank",
+}
 
 GROUP_FEATURE_COLS = [
     "lgbm_v1_score",
@@ -59,6 +85,53 @@ def instrument_to_id_expr():
         .cast(pl.Int8)
         .alias("instrument_id")
     )
+
+
+def infer_instrument_from_filename(file_name: str) -> str:
+    lower_name = file_name.lower()
+    for instrument in INSTRUMENTS:
+        if instrument in lower_name:
+            return instrument
+    return "unknown"
+
+
+def mask_rt_qvalue_anomaly_features(feature_df: pl.DataFrame, feature_cols):
+    columns_to_mask = [
+        col for col in RT_QVALUE_ANOMALY_FEATURES
+        if col in feature_cols and col in feature_df.columns
+    ]
+    if not columns_to_mask or "instrument_id" not in feature_df.columns:
+        return feature_df
+
+    numeric_to_mask = [
+        col for col in columns_to_mask
+        if col not in RT_QVALUE_ANOMALY_CATEGORICAL_FEATURES
+    ]
+    categorical_to_mask = [
+        col for col in columns_to_mask
+        if col in RT_QVALUE_ANOMALY_CATEGORICAL_FEATURES
+    ]
+    anomaly_expr = pl.col("instrument_id").is_in(list(RT_QVALUE_ANOMALY_INSTRUMENT_IDS))
+    exprs = []
+    exprs.extend(
+        pl.when(anomaly_expr)
+        .then(pl.lit(None, dtype=pl.Float32))
+        .otherwise(pl.col(col))
+        .cast(pl.Float32)
+        .alias(col)
+        for col in numeric_to_mask
+    )
+    exprs.extend(
+        pl.when(anomaly_expr)
+        .then(pl.lit(-1))
+        .otherwise(pl.col(col))
+        .cast(pl.Int16)
+        .alias(col)
+        for col in categorical_to_mask
+    )
+    if exprs:
+        feature_df = feature_df.with_columns(exprs)
+    return feature_df
 
 
 def is_valid_parquet_file(path: Path) -> bool:
@@ -328,7 +401,12 @@ def build_group_features(feature_df: pl.DataFrame, pred):
     return score_df.select(["__row_id"] + GROUP_FEATURE_COLS)
 
 
-def process_one_file(path: Path, model_dirs, force: bool):
+def process_one_file(
+    path: Path,
+    model_dirs,
+    force: bool,
+    mask_rt_qvalue_anomaly: bool = False,
+):
     schema = set(pl.scan_parquet(path).collect_schema().names())
     if "group_feature_done" in schema and not force:
         print(f"已处理，跳过: {path}")
@@ -342,6 +420,8 @@ def process_one_file(path: Path, model_dirs, force: bool):
         print(f"v1 score fold ensemble: {len(model_dirs)} models")
 
     feature_df = prepare_feature_df(path, feature_cols)
+    if mask_rt_qvalue_anomaly:
+        feature_df = mask_rt_qvalue_anomaly_features(feature_df, feature_cols)
     pred = predict_ensemble(models, feature_df, feature_cols)
     group_df = build_group_features(feature_df, pred)
 
@@ -382,6 +462,17 @@ def main():
         help="兼容旧流程：单个 full v1 模型目录。未提供 --fold-model-dir 时使用。",
     )
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--only-instrument",
+        choices=INSTRUMENTS,
+        default=None,
+        help="Only process one instrument. Default keeps the existing all-instrument flow.",
+    )
+    parser.add_argument(
+        "--mask-rt-qvalue-anomaly",
+        action="store_true",
+        help="Mask tims/wiff RT/q-value anomaly features before v1 inference.",
+    )
     args = parser.parse_args()
 
     d = Path(args.parquet_dir)
@@ -398,10 +489,20 @@ def main():
         print("  ", model_dir)
 
     files = sorted(d.glob("*.parquet"))
+    if args.only_instrument is not None:
+        files = [
+            path for path in files
+            if infer_instrument_from_filename(path.name) == args.only_instrument
+        ]
     print("files:", len(files))
 
     for path in tqdm(files):
-        process_one_file(path, model_dirs, force=args.force)
+        process_one_file(
+            path,
+            model_dirs,
+            force=args.force,
+            mask_rt_qvalue_anomaly=args.mask_rt_qvalue_anomaly,
+        )
         gc.collect()
 
 
