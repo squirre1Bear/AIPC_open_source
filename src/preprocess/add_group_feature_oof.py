@@ -4,7 +4,7 @@
 #   --data-root /root/autodl-tmp/datasets/aipc \
 #   --fold-model-dir ~/aipc/models/lgbm_v1_oof \
 #   --splits train valid \
-#   --workers=12
+#   --workers=20
 #   --force
 
 from __future__ import annotations

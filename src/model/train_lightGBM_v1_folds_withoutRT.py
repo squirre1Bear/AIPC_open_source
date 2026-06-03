@@ -89,6 +89,23 @@ EXCLUDE_FEATURE_COLUMNS = {
     "fp_q_value_filled",
     "has_fp_q_value",
     "in_fp",
+    "lgbm_v1_score",
+    "lgbm_v1_group_size",
+    "lgbm_v1_group_rank",
+    "lgbm_v1_group_rank_pct",
+    "lgbm_v1_group_max",
+    "lgbm_v1_group_min",
+    "lgbm_v1_group_mean",
+    "lgbm_v1_group_std",
+    "lgbm_v1_group_top2",
+    "lgbm_v1_gap_to_top1",
+    "lgbm_v1_gap_to_top2",
+    "lgbm_v1_top1_margin",
+    "lgbm_v1_minus_group_mean",
+    "lgbm_v1_z_in_group",
+    "lgbm_v1_softmax_in_group",
+    "is_lgbm_v1_group_top1",
+    "is_lgbm_v1_group_top3",
 }
 
 NUMERIC_DTYPES = {
@@ -1528,7 +1545,7 @@ def main():
     parser.add_argument(
         "--num-threads",
         type=int,
-        default=max(1, os.cpu_count() or 1),
+        default=12,
     )
 
     parser.add_argument(

@@ -1,3 +1,14 @@
+# python src/experiments/train_by_instrument_v1_v2.py \
+#     --data-root /root/autodl-tmp/datasets/aipc \
+#     --out-root ~/aipc/models/exp_by_instrument \
+#     --steps v1 group-oof v2 \
+#     --num-threads 20 \
+#     --extra-v1-args "--skip-existing --fdr-min-delta 20" \
+#     --early-stopping-rounds 100 \
+#     --v1-num-boost-round 2000
+#     --extra-v2-args "--fdr-min-delta 20"
+#     --v2-num-boost-round 2000
+
 from __future__ import annotations
 
 import argparse
@@ -9,6 +20,7 @@ from pathlib import Path
 
 
 INSTRUMENTS = ["mzml", "tims", "wiff"]
+DEFAULT_CPU_THREADS = 12
 
 V1_ROWS = {
     "mzml": {"train_max_rows": 10_000_000, "valid_max_rows": 2_000_000, "max_rows_per_file": 150_000},
@@ -31,6 +43,21 @@ def script_path(relative_path: str) -> Path:
     return repo_root() / relative_path
 
 
+def resolve_repo_path(path_value: str) -> Path:
+    path = Path(path_value).expanduser()
+    if path.is_absolute():
+        return path
+    return repo_root() / path
+
+
+def out_root(args: argparse.Namespace) -> Path:
+    return resolve_repo_path(args.out_root)
+
+
+def pred_out_path(args: argparse.Namespace) -> Path:
+    return resolve_repo_path(args.pred_out_path)
+
+
 def append_common_flags(cmd: list[str], flags: list[str]) -> list[str]:
     if isinstance(flags, str):
         flags = shlex.split(flags)
@@ -39,12 +66,23 @@ def append_common_flags(cmd: list[str], flags: list[str]) -> list[str]:
     return cmd
 
 
-def run_command(cmd: list[str], dry_run: bool) -> None:
+def run_command(cmd: list[str], dry_run: bool, cpu_threads: int = DEFAULT_CPU_THREADS) -> None:
     print("\n" + " ".join(cmd), flush=True)
     if dry_run:
         return
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
+    cpu_threads = env.get("AIPC_CPU_THREADS", str(max(1, int(cpu_threads))))
+    for key in [
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "TBB_NUM_THREADS",
+    ]:
+        env[key] = cpu_threads
+    env.setdefault("POLARS_MAX_THREADS", cpu_threads)
     subprocess.run(cmd, check=True, env=env)
 
 
@@ -57,7 +95,7 @@ def build_v1_command(args: argparse.Namespace, instrument: str) -> list[str]:
             "--data-root",
             args.data_root,
             "--out-dir",
-            str(Path(args.out_root).expanduser() / "v1" / instrument),
+            str(out_root(args) / "v1" / instrument),
             "--only-instrument",
             instrument,
             "--n-folds",
@@ -96,7 +134,7 @@ def build_group_oof_command(args: argparse.Namespace, instrument: str) -> list[s
         "--data-root",
         args.data_root,
         "--fold-model-dir",
-        str(Path(args.out_root).expanduser() / "v1" / instrument),
+        str(out_root(args) / "v1" / instrument),
         "--splits",
         "train",
         "valid",
@@ -116,7 +154,7 @@ def build_group_test_command(args: argparse.Namespace, instrument: str) -> list[
         "--parquet-dir",
         args.test_parquet_dir,
         "--fold-model-dir",
-        str(Path(args.out_root).expanduser() / "v1" / instrument),
+        str(out_root(args) / "v1" / instrument),
         "--only-instrument",
         instrument,
         "--mask-rt-qvalue-anomaly",
@@ -133,9 +171,9 @@ def build_v2_command(args: argparse.Namespace, instrument: str) -> list[str]:
             "--data-root",
             args.data_root,
             "--v1-model-dir",
-            str(Path(args.out_root).expanduser() / "v1" / instrument),
+            str(out_root(args) / "v1" / instrument),
             "--out-dir",
-            str(Path(args.out_root).expanduser() / "v2" / instrument),
+            str(out_root(args) / "v2" / instrument),
             "--only-instrument",
             instrument,
             "--mode",
@@ -167,11 +205,11 @@ def build_predict_command(args: argparse.Namespace) -> list[str]:
     return [
         sys.executable,
         str(script_path("src/submit/predict.py")),
-        str(Path(args.out_root).expanduser() / "v2"),
+        str(out_root(args) / "v2"),
         "--parquet_dir",
         args.test_parquet_dir,
         "--out_path",
-        args.pred_out_path,
+        str(pred_out_path(args)),
     ]
 
 
@@ -202,7 +240,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v1-num-boost-round", type=int, default=3000)
     parser.add_argument("--v2-num-boost-round", type=int, default=3000)
     parser.add_argument("--early-stopping-rounds", type=int, default=150)
-    parser.add_argument("--num-threads", type=int, default=max(1, os.cpu_count() or 1))
+    parser.add_argument("--num-threads", type=int, default=DEFAULT_CPU_THREADS)
     parser.add_argument("--group-workers", type=int, default=12)
     parser.add_argument("--extra-v1-args", type=str, default="")
     parser.add_argument("--extra-v2-args", type=str, default="")
@@ -211,14 +249,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    out_root = Path(args.out_root).expanduser()
+    resolved_out_root = out_root(args)
     if not args.dry_run:
-        (out_root / "v1").mkdir(parents=True, exist_ok=True)
-        (out_root / "v2").mkdir(parents=True, exist_ok=True)
+        (resolved_out_root / "v1").mkdir(parents=True, exist_ok=True)
+        (resolved_out_root / "v2").mkdir(parents=True, exist_ok=True)
 
     print("========== per-instrument experiment ==========")
     print("data_root:", args.data_root)
-    print("out_root:", out_root)
+    print("out_root:", resolved_out_root)
     print("steps:", args.steps)
     print("instruments:", args.instruments)
     print("dry_run:", args.dry_run)
@@ -231,10 +269,14 @@ def main() -> None:
     }
     for step in args.steps:
         if step == "predict":
-            run_command(build_predict_command(args), dry_run=args.dry_run)
+            run_command(build_predict_command(args), dry_run=args.dry_run, cpu_threads=args.num_threads)
             continue
         for instrument in args.instruments:
-            run_command(command_builders[step](args, instrument), dry_run=args.dry_run)
+            run_command(
+                command_builders[step](args, instrument),
+                dry_run=args.dry_run,
+                cpu_threads=args.num_threads,
+            )
 
 
 if __name__ == "__main__":

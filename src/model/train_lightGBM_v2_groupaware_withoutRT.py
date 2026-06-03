@@ -788,7 +788,7 @@ def main():
         action="store_true",
         help="使用 cum_decoy/cum_target；默认使用 max(cum_decoy, 1)/cum_target，更贴近官方工具。",
     )
-    parser.add_argument("--num-threads", type=int, default=max(1, os.cpu_count() or 1))
+    parser.add_argument("--num-threads", type=int, default=12)
 
     parser.add_argument("--hard-group-frac", type=float, default=0.45)
     parser.add_argument("--high-conf-group-frac", type=float, default=0.25)
