@@ -1,7 +1,7 @@
 # python src/submit/predict.py \
-#   ~/aipc/models/lgbm_v1_oof \
+#   ~/aipc/models/exp_by_instrument/v2/mzml \
 #   --parquet_dir /root/autodl-tmp/datasets/aipc/processed/bas_merged \
-#   --out_path /root/autodl-tmp/datasets/aipc/submissions/lgbm_v1_oof
+#   --out_path /root/autodl-tmp/datasets/aipc/submissions/lgbm_v2_rank_mzml
 
   # python src/submit/predict.py \
   #   ~/aipc/models/lgbm_v2_binary \
@@ -312,7 +312,12 @@ def normalize_test_columns(df: pl.DataFrame, file_name: str) -> pl.DataFrame:
     return df
 
 
-def prepare_feature_df(df: pl.DataFrame, feature_cols: list[str], file_name: str) -> pd.DataFrame:
+def prepare_feature_df(
+    df: pl.DataFrame,
+    feature_cols: list[str],
+    file_name: str,
+    mask_rt_qvalue_anomaly: bool = True,
+) -> pd.DataFrame:
     """
     从 parquet DataFrame 中取出模型需要的特征列。
     若缺少训练时需要的特征，直接报错，避免静默生成错误提交。
@@ -369,12 +374,15 @@ def prepare_feature_df(df: pl.DataFrame, feature_cols: list[str], file_name: str
 
     X = df_feat.to_pandas()
     X = X.replace([np.inf, -np.inf], np.nan)
-    X = mask_rt_qvalue_anomaly_features(
-        X,
-        df,
-        feature_cols,
-        context=f"predict {file_name}",
-    )
+    if mask_rt_qvalue_anomaly:
+        X = mask_rt_qvalue_anomaly_features(
+            X,
+            df,
+            feature_cols,
+            context=f"predict {file_name}",
+        )
+    else:
+        logger.info(f"predict {file_name}: RT/q-value anomaly masking disabled")
 
     return X
 
@@ -383,6 +391,7 @@ def predict_one_file(
     model_bundle,
     file_path: str,
     out_path: str,
+    mask_rt_qvalue_anomaly: bool = True,
 ):
     """
     对单个 parquet 文件推理，生成无表头 csv：
@@ -404,15 +413,17 @@ def predict_one_file(
     df = pl.read_parquet(file_path)
 
     if "index" not in df.columns:
-        logger.warning(f"{file_name} 缺少 index，将生成临时 index。")
-        df = df.with_columns(
-            pl.arange(0, pl.len()).cast(pl.Int64).alias("index")
-        )
+        raise RuntimeError(f"{file_name} 缺少官方 index，不能生成提交文件")
 
     index = df["index"].to_numpy()
 
     model, feature_cols = select_model_for_file(model_bundle, file_path)
-    X = prepare_feature_df(df, feature_cols, file_path.name)
+    X = prepare_feature_df(
+        df,
+        feature_cols,
+        file_path.name,
+        mask_rt_qvalue_anomaly=mask_rt_qvalue_anomaly,
+    )
 
     best_iter = getattr(model, "best_iteration", None)
 
@@ -548,6 +559,12 @@ def main():
         help="Basic 测试集期望行数；不想检查可设为 -1"
     )
 
+    parser.add_argument(
+        "--disable-rt-qvalue-anomaly-mask",
+        action="store_true",
+        help="关闭 tims/wiff 的 delta_rt/predicted_rt/spectrum_q 及派生异常特征掩码。默认开启掩码。",
+    )
+
     args = parser.parse_args()
 
     logger.info("Initializing LightGBM inference.")
@@ -583,6 +600,7 @@ def main():
                 model_bundle=model_bundle,
                 file_path=str(file_path),
                 out_path=out_path,
+                mask_rt_qvalue_anomaly=not args.disable_rt_qvalue_anomaly_mask,
             )
         except Exception as e:
             logger.exception(f"load {file_path} error: {e}!!!")
