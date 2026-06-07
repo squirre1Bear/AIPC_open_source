@@ -318,16 +318,6 @@ clean_peptide_prior_score =
 - `decoy_count`：该 clean peptide 在训练集中 label 为 decoy 的 PSM 数量。
 - `+1`：Laplace smoothing，避免只有 target 或只有 decoy 时出现除零，同时降低极低计数 peptide 的不稳定性。
 
-最终融合：
-
-```text
-final_score =
-  top1_consensus_score
-  + 4.5 * sequence_ngram_score
-  + 4.0 * global_peptide_support_score
-  + 4.0 * clean_peptide_prior_score
-```
-
 ## 5. 生成提交结果
 
 ```bash
