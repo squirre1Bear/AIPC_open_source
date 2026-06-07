@@ -14,6 +14,16 @@
   -> 生成 all_pred.zip
 ```
 
+最终重打分分数为：
+
+```text
+final_score =
+  top1_consensus_score
+  + 4.5 * sequence_ngram_score
+  + 4 * global_peptide_support_score
+  + 4 * clean_peptide_prior_score
+```
+
 ## 目录结构
 
 ```text
