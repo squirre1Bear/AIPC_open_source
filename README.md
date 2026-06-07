@@ -62,7 +62,7 @@
   /root/autodl-tmp/datasets/aipc/processed_split/train
   /root/autodl-tmp/datasets/aipc/processed_split/valid
 
-  ## 2. LightGBM v1：基础 PSM 打分
+  ## 2. LightGBM v1 生成基础 PSM 打分
 
   后续 rescoring 的基础列是：
 
@@ -119,15 +119,11 @@
 
   这一步会把 fold ensemble 的 lgbm_v1_score 写回测试 parquet，并生成 group 内排序统计特征。
 
-  ## 3. 基础 Benchmark：seq_support_strong
+  ## 3. 基础 Benchmark
 
   最终提交的主要模型是：
 
   seq_support_a12_b0p5_sw4p5_pw4
-
-  生成目录：
-
-  /root/aipc/submissions/0605/seq_support_strong_cpu16_best_20260605_204201
 
   该模型由三类信号组成：
 
@@ -135,7 +131,8 @@
     top1_consensus_score
     + 4.5 * sequence_ngram_score
     + 4.0 * global_peptide_support_score
-  其中参数含义如下。
+
+  其中参数含义如下：
 
   ### 3.1 top1 consensus score
 
@@ -150,7 +147,7 @@
   top1_consensus_score =
     base
     + beta * (peptide_top1_score - base)
-    - alpha * log1p(peptide_rank0)
+    - alpha * log(1 + peptide_rank0)
 
   当前参数：
 
@@ -178,8 +175,7 @@
 
   由于原始 PSM 模型容易把同一个高置信 peptide 的多个谱图都排在前面。
   但官方指标按唯一 peptide 计数，重复 PSM 不会线性增加分数。
-  因此需要保留每个 peptide 的最高证据，同时压低重复 PSM 的排序优先级。 
-  基于唯一 peptide 指标对所有重复 PSM 做重排。
+  因此需要保留每个 peptide 的最高证据，同时压低重复 PSM 的排序优先级。
 
   ### 3.2 sequence n-gram score
 
@@ -188,11 +184,17 @@
   核心处理流程：
 
   precursor_sequence
+
     -> clean peptide sequence
+
     -> 去除修饰
+
     -> 添加边界符：^PEPTIDE$
+
     -> 字符 3-5 gram
+
     -> HashingVectorizer
+
     -> SGDClassifier(log_loss)
 
   当前参数：
@@ -209,25 +211,31 @@
   参数含义：
 
   ngram_min=3, ngram_max=5
+
     使用长度为 3 到 5 的氨基酸字符片段。
     3-gram 能捕捉局部组成模式，5-gram 能捕捉更长的局部序列上下文。
 
   n_features_power=21
+
     HashingVectorizer 的特征维度为 2^21。
     维度足够大，可以降低 hash collision，同时保持内存可控。
 
   sgd_alpha=1e-5
+
     SGDClassifier 的 L2 正则强度。
     较小 alpha 允许模型学习较丰富的 n-gram 模式。
 
   sgd_max_iter=8
+
     训练迭代轮数。当前数据规模较大，8 轮在速度和收敛之间较平衡。
 
   n_hash_folds=16
+
     按 peptide 文本 hash 到 16 个 fold。
     验证时每个 peptide 使用不包含该 hash fold 的模型打分，避免同一 peptide 在训练和验证中直接记忆导致离线泄漏。
 
   seq_weight=4.5
+
     sequence n-gram 分数在最终 benchmark 中的融合权重。
 
   
